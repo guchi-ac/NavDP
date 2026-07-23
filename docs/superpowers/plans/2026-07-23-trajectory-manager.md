@@ -286,10 +286,22 @@ class TrajectoryManager:
                         history[segment_index + 1] - history[segment_index]
                     )
                     candidate_heading = candidate[1] - candidate[0]
-                    if (
+                    heading_deltas = [
                         self._heading_delta(history_heading, candidate_heading)
-                        > self.join_heading
-                    ):
+                    ]
+                    if join_distance_m > self.point_spacing:
+                        connector_heading = candidate[0] - join_point
+                        heading_deltas = [
+                            self._heading_delta(
+                                history_heading,
+                                connector_heading,
+                            ),
+                            self._heading_delta(
+                                connector_heading,
+                                candidate_heading,
+                            ),
+                        ]
+                    if max(heading_deltas) > self.join_heading:
                         reason = "join_heading"
                     else:
                         combined = self._normalize_polyline(
@@ -393,6 +405,17 @@ class TrajectoryManager:
             self._active_traj,
             chassis,
         )
+        forward_length = float(
+            np.linalg.norm(
+                self._active_traj[segment_index + 1] - projection
+            )
+        )
+        if segment_index + 1 < len(self._active_traj) - 1:
+            forward_length += self._polyline_length(
+                self._active_traj[segment_index + 1 :]
+            )
+        if forward_length < self.min_remaining:
+            return None, True
         try:
             remainder = self._normalize_polyline(
                 np.vstack(
@@ -404,8 +427,6 @@ class TrajectoryManager:
                 )
             )
         except ValueError:
-            return None, True
-        if self._polyline_length(remainder) < self.min_remaining:
             return None, True
         advanced = self._resample_polyline(remainder)
         advanced[0] = chassis

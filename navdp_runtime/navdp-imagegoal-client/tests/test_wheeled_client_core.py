@@ -179,6 +179,23 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertFalse(result.candidate_accepted)
         self.assertEqual(result.reason, "join_heading")
 
+    def test_rejects_lateral_join_bridge_despite_matching_path_headings(self):
+        manager = self.make_manager(join_heading_degrees=60.0)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[1.0, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.10, 0.0],
+            np.array([[1.0, 0.4], [2.0, 0.4]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "join_heading")
+
     def test_low_critic_candidate_retains_history_until_exhausted(self):
         manager = self.make_manager(min_remaining=0.20)
         manager.update(
@@ -198,6 +215,32 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertIsNotNone(retained.active_traj)
         self.assertIsNone(exhausted.active_traj)
         self.assertEqual(exhausted.reason, "history_exhausted")
+
+    def test_history_exhausts_when_chassis_has_overshot_terminal_point(self):
+        manager = self.make_manager(min_remaining=0.20)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.5, 0.0], [1.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update([1.30, 0.0])
+
+        self.assertIsNone(result.active_traj)
+        self.assertEqual(result.reason, "history_exhausted")
+
+    def test_history_exhaustion_ignores_lateral_correction_near_terminal(self):
+        manager = self.make_manager(min_remaining=0.20)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.5, 0.0], [1.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update([0.95, 0.30])
+
+        self.assertIsNone(result.active_traj)
+        self.assertEqual(result.reason, "history_exhausted")
 
     def test_invalid_candidate_retains_history(self):
         manager = self.make_manager()

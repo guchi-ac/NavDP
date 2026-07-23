@@ -51,7 +51,10 @@ internal copy so callers cannot mutate its state.
 
 At the beginning of every planning cycle, project the current chassis position
 onto the segments of the existing `active_traj`. Remove the portion already
-traversed and retain the forward suffix. Build the new suffix from:
+traversed and retain the forward suffix. Determine exhaustion from the
+historical arc between that projection and the terminal point; do not count
+the chassis-to-projection correction distance as remaining history. Build an
+executable suffix from:
 
 1. the exact current chassis position;
 2. the closest projected point when it is distinct from the chassis; and
@@ -75,8 +78,9 @@ a far-field candidate:
 
 1. Find the closest point on the forward historical polyline to the
    candidate's first point.
-2. Measure the Euclidean join distance and the change in path heading at the
-   join.
+2. Measure the Euclidean join distance and both heading changes through the
+   connector: history-to-connector and connector-to-candidate. Treat a
+   connector no longer than one resampling interval as coincident.
 3. Accept the candidate only when the join distance is no more than `0.50 m`
    and the absolute heading change is no more than `60 degrees`.
 4. Retain the historical path from the chassis through the join point.
