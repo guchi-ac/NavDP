@@ -30,20 +30,20 @@
 
 - [ ] **Step 1: Write the failing renderer test**
 
-Extend `test_draws_actual_green_mpc_red_and_robot_white` with an active guide
-trajectory that does not overlap the existing red and green probes:
+Extend `test_draws_discrete_guide_points_and_robot_over_the_chassis_anchor`
+with an actual 0.05 m-spaced guide fixture that does not overlap the existing
+red and green probes:
 
 ```python
-active_traj=np.array([[0.0, 0.5], [0.5, 0.5], [1.0, 0.5]]),
+active_traj=np.array(
+    [[0.50, 0.50], [0.55, 0.50], [0.60, 0.50], [0.65, 0.50]]
+),
 ```
 
-Assert that the guide-point pixel is yellow in BGR ordering:
-
-```python
-self.assertGreater(frame[495, 315, 1], 200)
-self.assertGreater(frame[495, 315, 2], 200)
-self.assertLess(frame[495, 315, 0], 80)
-```
+Assert conceptually that later 0.05 m samples have a dark pixel separating
+their yellow centers, the enlarged first point is yellow at its outer edge,
+the yellow `guide` legend swatch is present, and a second chassis-anchor
+fixture leaves the robot marker white when drawn over its guide point.
 
 - [ ] **Step 2: Run the test and verify RED**
 
@@ -52,7 +52,7 @@ Run:
 ```bash
 cd navdp_runtime/navdp-imagegoal-client/tests
 PYTHONPATH=.. python3 -m unittest \
-  test_rgb_bev_visualizer.RenderingTests.test_draws_actual_green_mpc_red_and_robot_white -v
+  test_rgb_bev_visualizer.RenderingTests.test_draws_discrete_guide_points_and_robot_over_the_chassis_anchor -v
 ```
 
 Expected: failure because `render_mpc_rgb_bev` does not accept
@@ -68,7 +68,7 @@ active_traj: Optional[np.ndarray] = None,
 
 When odometry is available, convert the guide trajectory with
 `world_xy_to_current_base`. Draw every point as a filled yellow BGR
-`(0, 255, 255)` circle of radius 2, with the first point radius 4. Draw the
+`(0, 255, 255)` circle of radius 1, with the first point radius 4. Draw the
 guide before the white robot marker, and add a yellow `guide` legend entry.
 
 - [ ] **Step 4: Run renderer tests and verify GREEN**
