@@ -196,6 +196,36 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertFalse(result.candidate_accepted)
         self.assertEqual(result.reason, "join_heading")
 
+    def test_short_join_is_snapped_without_exceeding_heading_limit(self):
+        manager = self.make_manager(join_heading_degrees=60.0)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[1.0, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.10, 0.0],
+            np.array([[1.0, 0.05], [2.0, 0.05]]),
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        segment_headings = np.arctan2(
+            np.diff(result.active_traj[:, 1]),
+            np.diff(result.active_traj[:, 0]),
+        )
+        heading_changes = np.abs(
+            np.arctan2(
+                np.sin(np.diff(segment_headings)),
+                np.cos(np.diff(segment_headings)),
+            )
+        )
+        self.assertLessEqual(
+            float(np.max(heading_changes)),
+            math.radians(60.0),
+        )
+
     def test_low_critic_candidate_retains_history_until_exhausted(self):
         manager = self.make_manager(min_remaining=0.20)
         manager.update(

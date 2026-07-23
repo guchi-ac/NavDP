@@ -80,7 +80,8 @@ a far-field candidate:
    candidate's first point.
 2. Measure the Euclidean join distance and both heading changes through the
    connector: history-to-connector and connector-to-candidate. Treat a
-   connector no longer than one resampling interval as coincident.
+   connector no longer than one resampling interval as coincident by snapping
+   the candidate's first point onto the historical join point.
 3. Accept the candidate only when the join distance is no more than `0.50 m`
    and the absolute heading change is no more than `60 degrees`.
 4. Retain the historical path from the chassis through the join point.

@@ -93,44 +93,65 @@ class TrajectoryManager:
                 if join_distance_m > self.join_distance:
                     reason = "join_distance"
                 else:
-                    history_heading = (
-                        history[segment_index + 1] - history[segment_index]
-                    )
-                    candidate_heading = candidate[1] - candidate[0]
-                    heading_deltas = [
-                        self._heading_delta(history_heading, candidate_heading)
-                    ]
-                    if join_distance_m > self.point_spacing:
-                        connector_heading = candidate[0] - join_point
+                    candidate_for_join = candidate
+                    if join_distance_m <= self.point_spacing:
+                        snapped_candidate = candidate.copy()
+                        snapped_candidate[0] = join_point
+                        try:
+                            candidate_for_join = self._normalize_polyline(
+                                snapped_candidate
+                            )
+                        except ValueError:
+                            candidate_for_join = None
+                            reason = "candidate_too_short"
+                    if candidate_for_join is not None:
+                        history_heading = (
+                            history[segment_index + 1]
+                            - history[segment_index]
+                        )
+                        candidate_heading = (
+                            candidate_for_join[1] - candidate_for_join[0]
+                        )
                         heading_deltas = [
                             self._heading_delta(
                                 history_heading,
-                                connector_heading,
-                            ),
-                            self._heading_delta(
-                                connector_heading,
                                 candidate_heading,
-                            ),
+                            )
                         ]
-                    if max(heading_deltas) > self.join_heading:
-                        reason = "join_heading"
-                    else:
-                        combined = self._normalize_polyline(
-                            np.vstack(
-                                (
-                                    history[: segment_index + 1],
-                                    join_point,
-                                    candidate,
+                        if join_distance_m > self.point_spacing:
+                            connector_heading = candidate_for_join[0] - join_point
+                            heading_deltas = [
+                                self._heading_delta(
+                                    history_heading,
+                                    connector_heading,
+                                ),
+                                self._heading_delta(
+                                    connector_heading,
+                                    candidate_heading,
+                                ),
+                            ]
+                        if max(heading_deltas) > self.join_heading:
+                            reason = "join_heading"
+                        else:
+                            combined = self._normalize_polyline(
+                                np.vstack(
+                                    (
+                                        history[: segment_index + 1],
+                                        join_point,
+                                        candidate_for_join,
+                                    )
                                 )
                             )
-                        )
-                        joined = self._resample_polyline(combined)
-                        if self._polyline_length(joined) >= self.min_remaining:
-                            active = joined
-                            accepted = True
-                            reason = "candidate_joined"
-                        else:
-                            reason = "candidate_too_short"
+                            joined = self._resample_polyline(combined)
+                            if (
+                                self._polyline_length(joined)
+                                >= self.min_remaining
+                            ):
+                                active = joined
+                                accepted = True
+                                reason = "candidate_joined"
+                            else:
+                                reason = "candidate_too_short"
 
         if active is None and had_history and candidate_world_xy is None:
             reason = "history_exhausted"
