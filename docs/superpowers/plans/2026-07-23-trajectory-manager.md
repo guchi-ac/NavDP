@@ -69,8 +69,8 @@ class TrajectoryManagerTests(unittest.TestCase):
 Run:
 
 ```bash
-cd navdp_runtime/navdp-imagegoal-client
-python3 -m unittest tests.test_wheeled_client_core.TrajectoryManagerTests.test_initial_candidate_starts_at_chassis_and_fills_near_field -v
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest test_wheeled_client_core.TrajectoryManagerTests.test_initial_candidate_starts_at_chassis_and_fills_near_field -v
 ```
 
 Expected: FAIL because `TrajectoryManager` does not exist.
@@ -189,8 +189,8 @@ def test_result_does_not_allow_mutating_manager_state(self):
 Run:
 
 ```bash
-cd navdp_runtime/navdp-imagegoal-client
-python3 -m unittest tests.test_wheeled_client_core.TrajectoryManagerTests -v
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest test_wheeled_client_core.TrajectoryManagerTests -v
 ```
 
 Expected: FAIL only because the manager interfaces are missing.
@@ -434,8 +434,8 @@ copies in `TrajectoryUpdate`.
 Run:
 
 ```bash
-cd navdp_runtime/navdp-imagegoal-client
-python3 -m unittest tests.test_wheeled_client_core.TrajectoryManagerTests -v
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest test_wheeled_client_core.TrajectoryManagerTests -v
 ```
 
 Expected: all manager tests PASS.
@@ -479,8 +479,8 @@ Keep arrival precedence by testing `arrival_blocked=True` together with
 Run:
 
 ```bash
-cd navdp_runtime/navdp-imagegoal-client
-python3 -m unittest tests.test_wheeled_client_core.ControlDeadmanTests -v
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest test_wheeled_client_core.ControlDeadmanTests -v
 ```
 
 Expected: FAIL because the function still accepts `critic_safe`.
@@ -526,10 +526,10 @@ def control_stop_reason(
 Run:
 
 ```bash
-cd navdp_runtime/navdp-imagegoal-client
-python3 -m unittest \
-  tests.test_wheeled_client_core.ControlDeadmanTests \
-  tests.test_wheeled_client_core.TrajectoryManagerTests -v
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest \
+  test_wheeled_client_core.ControlDeadmanTests \
+  test_wheeled_client_core.TrajectoryManagerTests -v
 ```
 
 Expected: all selected tests PASS.
@@ -675,11 +675,11 @@ add the four parser arguments with the approved defaults.
 Run:
 
 ```bash
-cd navdp_runtime/navdp-imagegoal-client
-python3 -m unittest \
-  tests.test_wheeled_client_core.TrajectoryManagerTests \
-  tests.test_wheeled_client_core.ControlDeadmanTests \
-  tests.test_wheeled_client_core.RosClientSourceTests -v
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest \
+  test_wheeled_client_core.TrajectoryManagerTests \
+  test_wheeled_client_core.ControlDeadmanTests \
+  test_wheeled_client_core.RosClientSourceTests -v
 ```
 
 Expected: all selected tests PASS.
