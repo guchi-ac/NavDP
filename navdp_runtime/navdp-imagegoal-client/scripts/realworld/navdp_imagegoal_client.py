@@ -103,6 +103,7 @@ class VisualizationRequest:
 @dataclass(frozen=True)
 class MpcVisualizationSnapshot:
     predicted_states: np.ndarray
+    active_traj: np.ndarray
     command: np.ndarray
     solve_ms: float
     updated_at: float
@@ -904,10 +905,12 @@ class NavdpImageGoalClient(Node):
             mpc_timeout=self.args.mpc_bev_timeout,
         )
         predicted_states = None
+        active_traj = None
         command = np.zeros(2, dtype=np.float64)
         solve_ms = None
         if mpc_fresh:
             predicted_states = mpc_snapshot.predicted_states
+            active_traj = mpc_snapshot.active_traj
             command = mpc_snapshot.command
             solve_ms = mpc_snapshot.solve_ms
         if odom_status != "ODOM OK":
@@ -927,6 +930,7 @@ class NavdpImageGoalClient(Node):
             mpc_status,
             self.bev_config,
             actual_velocity=actual_velocity,
+            active_traj=active_traj,
         )
 
     def _append_mpc_bev_video(self, snapshot: FrameSnapshot) -> None:
@@ -1028,6 +1032,8 @@ class NavdpImageGoalClient(Node):
                             solve_ms = (
                                 time.perf_counter() - solve_started
                             ) * 1000.0
+                            active_traj_snapshot = np.asarray(self.mpc.ref_traj).copy()
+                            active_traj_snapshot.setflags(write=False)
                     if reason is None:
                         linear = float(np.clip(controls[0, 0], 0.0, self.args.max_v))
                         angular = float(
@@ -1044,6 +1050,7 @@ class NavdpImageGoalClient(Node):
                             self.latest_mpc_visualization = (
                                 MpcVisualizationSnapshot(
                                     predicted_states=predicted_snapshot,
+                                    active_traj=active_traj_snapshot,
                                     command=command_snapshot,
                                     solve_ms=float(solve_ms),
                                     updated_at=time.monotonic(),

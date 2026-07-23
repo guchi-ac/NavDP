@@ -206,6 +206,34 @@ GPU 服务端官方 MP4 在 HTTP 响应返回前生成；客户端 MP4 记录 10
 `/cmd_vel` 的 `desired` 线速度/角速度和 `/odom` 返回的 `actual` 线速度/
 角速度；里程计缺失或过期时实际速度显示为 `nan`。
 
+MPC BEV 视频的图层从下到上包括绿色 `actual` 实走里程计、红色 `MPC` 预测
+轨迹、黄色 `guide` 离散引导点，以及最后绘制的白色底盘矩形和方向箭头。黄色
+点是本轮实际安装到 MPC 的 `active_traj`，第一个较大点表示底盘锚点；它们只在
+MPC 快照仍新鲜时显示，避免把过期计划误认为当前引导。
+
+相关渲染器和客户端源代码测试：
+
+```bash
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest test_rgb_bev_visualizer test_wheeled_client_core -v
+```
+
+完整相关测试套件：
+
+```bash
+cd navdp_runtime/navdp-imagegoal-client/tests
+PYTHONPATH=.. python3 -m unittest \
+  test_controllers \
+  test_goal_capture \
+  test_navigator_close.NavigatorCloseClientTests \
+  test_rgb_bev_visualizer \
+  test_wheeled_client_core -v
+```
+
+仓库完整发现测试中的 `NavigatorCloseServerTests` 仍依赖现有环境未提供的定制
+`baselines/navdp/navdp_server.py`，因此上述套件只运行不依赖该文件的
+`NavigatorCloseClientTests`。
+
 ## MPC 诊断日志
 
 客户端每次启动都会自动创建与 MP4 使用同一时间戳的 JSONL：

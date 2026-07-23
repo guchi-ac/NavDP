@@ -1377,6 +1377,35 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
+    def test_client_snapshots_active_trajectory_for_fresh_bev_rendering(self):
+        source = self.client_source()
+        tree = ast.parse(source)
+        render_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_mpc_bev"
+        )
+        render_source = ast.get_source_segment(source, render_method)
+
+        for required in (
+            "active_traj: np.ndarray",
+            "active_traj_snapshot = np.asarray(self.mpc.ref_traj).copy()",
+            "active_traj_snapshot.setflags(write=False)",
+            "active_traj=active_traj_snapshot",
+            "active_traj = None",
+            "active_traj = mpc_snapshot.active_traj",
+            "active_traj=active_traj",
+        ):
+            self.assertIn(required, source)
+
+        fresh_block_start = render_source.index("if mpc_fresh:")
+        active_traj_assignment = render_source.index(
+            "active_traj = mpc_snapshot.active_traj"
+        )
+        render_call = render_source.index("active_traj=active_traj")
+        self.assertLess(fresh_block_start, active_traj_assignment)
+        self.assertLess(active_traj_assignment, render_call)
+
     def test_client_queues_bev_frames_before_odom_or_plan_exists(self):
         client_path = (
             Path(__file__).resolve().parents[1]
