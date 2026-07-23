@@ -748,6 +748,16 @@ class VisualizationPipelineTests(unittest.TestCase):
 
 
 class RosClientSourceTests(unittest.TestCase):
+    @staticmethod
+    def client_source():
+        client_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "realworld"
+            / "navdp_imagegoal_client.py"
+        )
+        return client_path.read_text(encoding="utf-8")
+
     def test_client_has_real_robot_inputs_and_explicit_control_gate(self):
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -1161,22 +1171,53 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_client_sends_transformed_navdp_path_directly_to_mpc(self):
-        client_path = (
-            Path(__file__).resolve().parents[1]
-            / "scripts"
-            / "realworld"
-            / "navdp_imagegoal_client.py"
-        )
-        source = client_path.read_text(encoding="utf-8")
+    def test_client_routes_model_candidate_through_trajectory_manager(self):
+        source = self.client_source()
 
-        self.assertIn("world_xy = retained_world_xy", source)
-        self.assertNotIn("bridge_trajectory_with_bspline", source)
-        self.assertNotIn("bridge_gap_m", source)
-        self.assertIn(
-            'parser.add_argument("--skip-trajectory-points", type=int, default=0)',
-            source,
-        )
+        self.assertIn("TrajectoryManager(", source)
+        self.assertIn("candidate_eligible=critic_safe", source)
+        self.assertIn("active_traj = trajectory_update.active_traj", source)
+        self.assertIn("self.mpc.update_ref_traj(active_traj)", source)
+        self.assertNotIn("self.mpc.update_ref_traj(world_xy)", source)
+
+    def test_client_gates_control_on_active_trajectory(self):
+        source = self.client_source()
+
+        self.assertIn("self.trajectory_ready = False", source)
+        self.assertIn("trajectory_ready=self.trajectory_ready", source)
+        self.assertNotIn("critic_safe=self.critic_safe", source)
+
+    def test_client_blocks_control_when_active_trajectory_install_fails(self):
+        source = self.client_source()
+
+        self.assertIn("failed to install active trajectory", source)
+        self.assertIn('reason = "active_trajectory_error"', source)
+
+    def test_client_exposes_trajectory_manager_defaults(self):
+        source = self.client_source()
+
+        for required in (
+            '--trajectory-point-spacing", type=float, default=0.05',
+            '--trajectory-join-distance", type=float, default=0.50',
+            '--trajectory-join-heading-deg", type=float, default=60.0',
+            '--trajectory-min-remaining", type=float, default=0.20',
+        ):
+            self.assertIn(required, source)
+
+    def test_client_records_candidate_decision_and_active_trajectory(self):
+        source = self.client_source()
+
+        for required in (
+            '"candidate_world_xy": retained_world_xy',
+            '"active_traj": active_traj',
+            '"candidate_accepted": trajectory_update.candidate_accepted',
+            '"trajectory_reason": trajectory_update.reason',
+            '"trajectory_join_distance_m"',
+            "trajectory_update.join_distance_m",
+            '"trajectory_remaining_length_m"',
+            "trajectory_update.remaining_length_m",
+        ):
+            self.assertIn(required, source)
 
     def test_client_records_synchronized_mpc_diagnostics(self):
         client_path = (
