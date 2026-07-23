@@ -131,9 +131,6 @@ class TrajectoryManager:
                         continue
                     reached_commit = True
                     nearest_join_distance = min(nearest_join_distance, distance)
-                    if distance > self.join_distance:
-                        continue
-                    reached_distance = True
 
                     candidate_arc = float(
                         candidate_cumulative[candidate_index]
@@ -177,6 +174,9 @@ class TrajectoryManager:
                     if overlap_arcs[-1] <= overlap_arcs[0] + tolerance:
                         continue
                     reached_overlap = True
+                    if distance > self.join_distance:
+                        continue
+                    reached_distance = True
 
                     candidate_for_join = candidate_resampled[
                         candidate_index:
@@ -261,6 +261,8 @@ class TrajectoryManager:
                         reason = "candidate_too_short"
                 elif not reached_commit:
                     reason = "join_commit_horizon"
+                elif not reached_overlap:
+                    reason = "join_overlap"
                 elif not reached_distance:
                     join_distance_m = (
                         None
@@ -268,8 +270,6 @@ class TrajectoryManager:
                         else nearest_join_distance
                     )
                     reason = "join_distance"
-                elif not reached_overlap:
-                    reason = "join_overlap"
                 else:
                     reason = "join_heading"
 

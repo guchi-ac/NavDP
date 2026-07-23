@@ -153,6 +153,46 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertFalse(result.candidate_accepted)
         self.assertEqual(result.reason, "join_overlap")
 
+    def test_overlap_rejection_precedes_distance_for_mixed_failure(self):
+        manager = self.make_manager()
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [3.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 1.0], [3.0, 1.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "join_overlap")
+
+    def test_distance_rejection_reports_nearest_commit_qualified_projection(
+        self,
+    ):
+        manager = self.make_manager(
+            join_distance=0.10,
+            overlap_distance=1.10,
+        )
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [3.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[1.2, 0.0], [1.2, 1.0], [3.0, 1.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "join_distance")
+        self.assertAlmostEqual(result.join_distance_m, 0.0)
+
     def test_accepts_continuous_overlap_and_preserves_history_to_splice(self):
         manager = self.make_manager()
         history = manager.update(
@@ -258,6 +298,7 @@ class TrajectoryManagerTests(unittest.TestCase):
             join_distance=0.10,
             commit_horizon=0.01,
             overlap_length=0.01,
+            overlap_distance=1.10,
         )
         manager.update(
             [0.0, 0.0],
