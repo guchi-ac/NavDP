@@ -172,6 +172,7 @@ class NavdpImageGoalClient(Node):
         self.latest_frame = None
         self.frame_sequence = 0
         self.mpc = None
+        self.installed_active_traj: Optional[np.ndarray] = None
         self.last_plan_time = None
         self.plan_sequence = 0
         self.latest_plan_id = None
@@ -693,6 +694,8 @@ class NavdpImageGoalClient(Node):
                             )
                         else:
                             self.mpc.update_ref_traj(active_traj)
+                        self.installed_active_traj = np.asarray(active_traj).copy()
+                        self.installed_active_traj.setflags(write=False)
                 except Exception as error:
                     with self.data_lock:
                         self.trajectory_ready = False
@@ -909,10 +912,11 @@ class NavdpImageGoalClient(Node):
         command = np.zeros(2, dtype=np.float64)
         solve_ms = None
         if mpc_fresh:
-            predicted_states = mpc_snapshot.predicted_states
-            active_traj = mpc_snapshot.active_traj
             command = mpc_snapshot.command
             solve_ms = mpc_snapshot.solve_ms
+        if mpc_fresh and odom_status == "ODOM OK":
+            predicted_states = mpc_snapshot.predicted_states
+            active_traj = mpc_snapshot.active_traj
         if odom_status != "ODOM OK":
             actual_velocity = None
 
@@ -1032,7 +1036,7 @@ class NavdpImageGoalClient(Node):
                             solve_ms = (
                                 time.perf_counter() - solve_started
                             ) * 1000.0
-                            active_traj_snapshot = np.asarray(self.mpc.ref_traj).copy()
+                            active_traj_snapshot = self.installed_active_traj.copy()
                             active_traj_snapshot.setflags(write=False)
                     if reason is None:
                         linear = float(np.clip(controls[0, 0], 0.0, self.args.max_v))

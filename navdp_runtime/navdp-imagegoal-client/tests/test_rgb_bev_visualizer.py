@@ -161,7 +161,7 @@ class RenderingTests(unittest.TestCase):
 
         np.testing.assert_array_equal(frame[360, 360], [0, 0, 255])
 
-    def test_draws_actual_green_mpc_red_and_robot_white(self):
+    def test_draws_discrete_guide_points_and_robot_over_the_chassis_anchor(self):
         frame = render_mpc_rgb_bev(
             np.zeros((2, 2, 3), dtype=np.uint8),
             np.zeros((2, 2), dtype=np.float32),
@@ -174,7 +174,9 @@ class RenderingTests(unittest.TestCase):
             predicted_states=np.array(
                 [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
             ),
-            active_traj=np.array([[0.0, 0.5], [0.5, 0.5], [1.0, 0.5]]),
+            active_traj=np.array(
+                [[0.50, 0.50], [0.55, 0.50], [0.60, 0.50], [0.65, 0.50]]
+            ),
             command=np.array([0.07, 0.2]),
             solve_ms=12.5,
             odom_status="ODOM OK",
@@ -186,9 +188,32 @@ class RenderingTests(unittest.TestCase):
         self.assertLess(frame[585, 360, 2], 80)
         self.assertGreater(frame[495, 360, 2], 200)
         self.assertLess(frame[495, 360, 1], 80)
-        self.assertGreater(frame[495, 315, 1], 200)
-        self.assertGreater(frame[495, 315, 2], 200)
-        self.assertLess(frame[495, 315, 0], 80)
+        # The first 0.05 m sample is enlarged, while later samples stay
+        # separated at the default 90 px/m BEV scale.
+        self.assertGreater(frame[495, 319, 1], 200)
+        self.assertGreater(frame[495, 319, 2], 200)
+        self.assertGreater(frame[486, 315, 1], 200)
+        self.assertGreater(frame[486, 315, 2], 200)
+        self.assertTrue((frame[484, 315] < 80).all())
+        self.assertGreater(frame[96, 205, 1], 200)
+        self.assertGreater(frame[96, 205, 2], 200)
+
+        chassis_anchor = render_mpc_rgb_bev(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            np.zeros((2, 2), dtype=np.float32),
+            np.eye(3),
+            np.eye(4),
+            current_odom_xy_yaw=np.zeros(3),
+            odom_history=np.empty((0, 3)),
+            predicted_states=None,
+            active_traj=np.array([[0.0, 0.0], [0.05, 0.0]]),
+            command=np.zeros(2),
+            solve_ms=None,
+            odom_status="ODOM OK",
+            mpc_status="MPC OK",
+            config=BevConfig(sample_stride=1),
+        )
+        self.assertTrue((chassis_anchor[540, 360] > 200).all())
         robot_region = frame[526:555, 346:375]
         self.assertTrue((robot_region > 200).all(axis=2).any())
 

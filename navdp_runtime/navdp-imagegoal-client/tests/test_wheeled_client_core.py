@@ -1389,7 +1389,10 @@ class RosClientSourceTests(unittest.TestCase):
 
         for required in (
             "active_traj: np.ndarray",
-            "active_traj_snapshot = np.asarray(self.mpc.ref_traj).copy()",
+            "self.installed_active_traj: Optional[np.ndarray] = None",
+            "self.installed_active_traj = np.asarray(active_traj).copy()",
+            "self.installed_active_traj.setflags(write=False)",
+            "active_traj_snapshot = self.installed_active_traj.copy()",
             "active_traj_snapshot.setflags(write=False)",
             "active_traj=active_traj_snapshot",
             "active_traj = None",
@@ -1398,13 +1401,36 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-        fresh_block_start = render_source.index("if mpc_fresh:")
+        fresh_block_start = render_source.index(
+            'if mpc_fresh and odom_status == "ODOM OK":'
+        )
         active_traj_assignment = render_source.index(
             "active_traj = mpc_snapshot.active_traj"
         )
         render_call = render_source.index("active_traj=active_traj")
         self.assertLess(fresh_block_start, active_traj_assignment)
         self.assertLess(active_traj_assignment, render_call)
+
+    def test_client_hides_odom_frame_paths_when_odom_is_stale_but_mpc_is_fresh(self):
+        source = self.client_source()
+        tree = ast.parse(source)
+        render_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_mpc_bev"
+        )
+        render_source = ast.get_source_segment(source, render_method)
+
+        self.assertIn(
+            'if mpc_fresh and odom_status == "ODOM OK":',
+            render_source,
+        )
+        guarded_paths = render_source[
+            render_source.index('if mpc_fresh and odom_status == "ODOM OK":') :
+            render_source.index('if odom_status != "ODOM OK":')
+        ]
+        self.assertIn("predicted_states = mpc_snapshot.predicted_states", guarded_paths)
+        self.assertIn("active_traj = mpc_snapshot.active_traj", guarded_paths)
 
     def test_client_queues_bev_frames_before_odom_or_plan_exists(self):
         client_path = (

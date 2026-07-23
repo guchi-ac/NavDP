@@ -4,7 +4,7 @@
 
 **Goal:** Render the current `active_traj` as yellow discrete guide points in `mpc_rgb_bev.mp4`.
 
-**Architecture:** Copy the active MPC guide trajectory into the immutable control-thread visualization snapshot, expose it to the BEV renderer only while that snapshot is fresh, and render it after the path layers but before the white robot marker. Keep trajectory management and control behavior unchanged.
+**Architecture:** Copy the pre-densification `TrajectoryManager.active_traj` installed into MPC into the immutable control-thread visualization snapshot, expose odometry-frame paths to the BEV renderer only while both that snapshot and odometry are fresh, and render guide points after the path layers but before the white robot marker. Keep trajectory management and control behavior unchanged.
 
 **Tech Stack:** Python 3, NumPy, OpenCV, `unittest`
 
@@ -12,7 +12,7 @@
 
 - Display only `active_traj`; do not add model candidates to this video.
 - Keep actual motion green, MPC prediction red, guide points yellow, and the robot marker white.
-- Hide guide points whenever the MPC snapshot is stale.
+- Hide prediction and guide points whenever the MPC snapshot is stale or odometry is not fresh.
 - Do not add runtime parameters or change MPC/control behavior.
 - Write and observe failing tests before production changes.
 
@@ -99,8 +99,8 @@ git commit -m "feat: render active guide points in MPC BEV"
 - Test: `navdp_runtime/navdp-imagegoal-client/tests/test_wheeled_client_core.py`
 
 **Interfaces:**
-- Consumes: the exact `active_traj` installed into the MPC controller.
-- Produces: immutable `MpcVisualizationSnapshot.active_traj` and a renderer call that passes it only for a fresh snapshot.
+- Consumes: the pre-densification `TrajectoryManager.active_traj` successfully installed into the MPC controller.
+- Produces: immutable `MpcVisualizationSnapshot.active_traj` and a renderer call that passes odometry-frame paths only when both MPC and odometry are fresh.
 
 - [ ] **Step 1: Write failing client wiring tests**
 
@@ -135,11 +135,14 @@ Expected: failure because the snapshot and renderer call do not carry
 
 - [ ] **Step 3: Implement snapshot and freshness wiring**
 
-Add `active_traj` to `MpcVisualizationSnapshot`. When a solve succeeds, copy
-the currently installed `self.mpc.ref_traj`, make the copy read-only, and store
-it in the same snapshot as predicted states. In `_render_mpc_bev`, default
-`active_traj` to `None`, fill it only under `if mpc_fresh`, and pass it by
-keyword to `render_mpc_rgb_bev`.
+Add `active_traj` to `MpcVisualizationSnapshot`. Immediately after a successful
+MPC create/update under `mpc_lock`, retain a read-only copy of the installed
+manager `active_traj` (not dense `self.mpc.ref_traj`). After a successful solve,
+copy that retained manager path under the same lock and store it in the same
+snapshot as the other read-only arrays. In `_render_mpc_bev`, default
+`predicted_states` and `active_traj` to `None`, fill both only when
+`mpc_fresh and odom_status == "ODOM OK"`, and pass the guide by keyword to
+`render_mpc_rgb_bev`.
 
 - [ ] **Step 4: Update the Chinese README**
 

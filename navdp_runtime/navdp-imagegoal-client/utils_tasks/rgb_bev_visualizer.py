@@ -243,7 +243,7 @@ def render_mpc_rgb_bev(
                 cv2.circle(
                     image,
                     (int(guide_col), int(guide_row)),
-                    4 if index == 0 else 2,
+                    4 if index == 0 else 1,
                     (0, 255, 255),
                     -1,
                 )
