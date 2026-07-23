@@ -92,9 +92,118 @@ class TrajectoryManagerTests(unittest.TestCase):
             join_distance=0.50,
             join_heading_degrees=60.0,
             min_remaining=0.20,
+            commit_horizon=1.0,
+            overlap_length=0.5,
+            overlap_distance=0.30,
         )
         values.update(changes)
         return client_core.TrajectoryManager(**values)
+
+    def test_commit_horizon_keeps_near_history_stable_across_oscillating_candidates(
+        self,
+    ):
+        manager = self.make_manager()
+        previous = manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [3.0, 0.0]]),
+            candidate_eligible=True,
+        ).active_traj
+
+        for lateral_offset in (1.0, -1.0):
+            result = manager.update(
+                [0.0, 0.0],
+                np.array(
+                    [
+                        [0.2, 0.0],
+                        [1.5, 0.0],
+                        [2.0, lateral_offset],
+                        [3.0, lateral_offset],
+                    ]
+                ),
+                candidate_eligible=True,
+            )
+
+            self.assertTrue(result.candidate_accepted)
+            np.testing.assert_array_equal(result.active_traj[0], [0.0, 0.0])
+            cumulative = client_core.TrajectoryManager._cumulative_lengths(
+                result.active_traj
+            )
+            committed = cumulative <= 1.0 + 1e-9
+            np.testing.assert_allclose(
+                result.active_traj[committed],
+                previous[: np.count_nonzero(committed)],
+                atol=1e-9,
+            )
+            previous = result.active_traj
+
+    def test_rejects_isolated_crossing_without_continuous_overlap(self):
+        manager = self.make_manager()
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [3.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[1.2, -1.0], [1.2, 0.0], [1.2, 1.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "join_overlap")
+
+    def test_accepts_continuous_overlap_and_preserves_history_to_splice(self):
+        manager = self.make_manager()
+        history = manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [3.0, 0.0]]),
+            candidate_eligible=True,
+        ).active_traj
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array(
+                [
+                    [0.2, 0.0],
+                    [1.5, 0.0],
+                    [2.0, 0.5],
+                    [3.0, 0.5],
+                ]
+            ),
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        self.assertGreaterEqual(result.preserved_length_m, 1.0)
+        self.assertLessEqual(result.overlap_error_m, 0.30)
+        cumulative = client_core.TrajectoryManager._cumulative_lengths(
+            result.active_traj
+        )
+        preserved = cumulative <= result.preserved_length_m + 1e-9
+        np.testing.assert_allclose(
+            result.active_traj[preserved],
+            history[: np.count_nonzero(preserved)],
+            atol=1e-9,
+        )
+
+    def test_short_history_reduces_commit_horizon_to_allow_extension(self):
+        manager = self.make_manager(min_remaining=0.2)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [0.8, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[0.2, 0.0], [0.8, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        self.assertGreaterEqual(result.preserved_length_m, 0.6)
+        self.assertLess(result.preserved_length_m, 1.0)
 
     def test_initial_candidate_starts_at_chassis_and_fills_near_field(self):
         manager = self.make_manager()
@@ -134,7 +243,7 @@ class TrajectoryManagerTests(unittest.TestCase):
 
         result = manager.update(
             [0.10, 0.0],
-            np.array([[1.05, 0.02], [2.0, 0.5]]),
+            np.array([[0.5, 0.0], [1.2, 0.0], [2.0, 0.5]]),
             candidate_eligible=True,
         )
 
@@ -145,7 +254,11 @@ class TrajectoryManagerTests(unittest.TestCase):
         )
 
     def test_rejects_distant_candidate_without_mutating_history(self):
-        manager = self.make_manager(join_distance=0.10)
+        manager = self.make_manager(
+            join_distance=0.10,
+            commit_horizon=0.01,
+            overlap_length=0.01,
+        )
         manager.update(
             [0.0, 0.0],
             np.array([[1.0, 0.0], [2.0, 0.0]]),
@@ -163,7 +276,11 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertLess(np.max(np.abs(result.active_traj[:, 1])), 0.11)
 
     def test_rejects_heading_discontinuity(self):
-        manager = self.make_manager(join_heading_degrees=30.0)
+        manager = self.make_manager(
+            join_heading_degrees=30.0,
+            commit_horizon=0.01,
+            overlap_length=0.01,
+        )
         manager.update(
             [0.0, 0.0],
             np.array([[1.0, 0.0], [2.0, 0.0]]),
@@ -172,7 +289,7 @@ class TrajectoryManagerTests(unittest.TestCase):
 
         result = manager.update(
             [0.10, 0.0],
-            np.array([[1.0, 0.0], [1.0, 1.0]]),
+            np.array([[1.0, 0.0], [1.5, 1.0]]),
             candidate_eligible=True,
         )
 
@@ -180,7 +297,12 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertEqual(result.reason, "join_heading")
 
     def test_rejects_lateral_join_bridge_despite_matching_path_headings(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
+        manager = self.make_manager(
+            join_heading_degrees=60.0,
+            commit_horizon=0.01,
+            overlap_length=0.01,
+            overlap_distance=0.50,
+        )
         manager.update(
             [0.0, 0.0],
             np.array([[1.0, 0.0], [2.0, 0.0]]),
@@ -197,7 +319,11 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertEqual(result.reason, "join_heading")
 
     def test_short_join_is_snapped_without_exceeding_heading_limit(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
+        manager = self.make_manager(
+            join_heading_degrees=60.0,
+            commit_horizon=0.01,
+            overlap_length=0.01,
+        )
         manager.update(
             [0.0, 0.0],
             np.array([[1.0, 0.0], [2.0, 0.0]]),

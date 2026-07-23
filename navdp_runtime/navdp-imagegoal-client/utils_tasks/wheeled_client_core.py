@@ -18,6 +18,8 @@ class TrajectoryUpdate:
     candidate_accepted: bool
     reason: str
     join_distance_m: Optional[float]
+    preserved_length_m: float
+    overlap_error_m: Optional[float]
     remaining_length_m: float
 
 
@@ -31,12 +33,18 @@ class TrajectoryManager:
         join_distance: float = 0.50,
         join_heading_degrees: float = 60.0,
         min_remaining: float = 0.20,
+        commit_horizon: float = 1.0,
+        overlap_length: float = 0.5,
+        overlap_distance: float = 0.30,
     ):
         values = {
             "point_spacing": point_spacing,
             "join_distance": join_distance,
             "join_heading_degrees": join_heading_degrees,
             "min_remaining": min_remaining,
+            "commit_horizon": commit_horizon,
+            "overlap_length": overlap_length,
+            "overlap_distance": overlap_distance,
         }
         for name, value in values.items():
             if not np.isfinite(value) or value <= 0.0:
@@ -45,6 +53,9 @@ class TrajectoryManager:
         self.join_distance = float(join_distance)
         self.join_heading = math.radians(float(join_heading_degrees))
         self.min_remaining = float(min_remaining)
+        self.commit_horizon = float(commit_horizon)
+        self.overlap_length = float(overlap_length)
+        self.overlap_distance = float(overlap_distance)
         self._active_traj = None
 
     def update(
@@ -61,6 +72,8 @@ class TrajectoryManager:
         active = history
         accepted = False
         join_distance_m = None
+        preserved_length_m = 0.0
+        overlap_error_m = None
         reason = "history_retained" if history is not None else "no_history"
 
         candidate = None
@@ -85,73 +98,180 @@ class TrajectoryManager:
                 else:
                     reason = "candidate_too_short"
             else:
-                (
-                    join_distance_m,
-                    segment_index,
-                    join_point,
-                ) = self._closest_projection(history, candidate[0])
-                if join_distance_m > self.join_distance:
-                    reason = "join_distance"
-                else:
-                    candidate_for_join = candidate
-                    if join_distance_m <= self.point_spacing:
-                        snapped_candidate = candidate.copy()
-                        snapped_candidate[0] = join_point
-                        try:
-                            candidate_for_join = self._normalize_polyline(
-                                snapped_candidate
+                candidate_resampled = self._resample_polyline(candidate)
+                history_cumulative = self._cumulative_lengths(history)
+                candidate_cumulative = self._cumulative_lengths(
+                    candidate_resampled
+                )
+                history_length = float(history_cumulative[-1])
+                effective_commit = min(
+                    self.commit_horizon,
+                    max(0.0, history_length - self.min_remaining),
+                )
+                tolerance = 1e-9
+                reached_commit = False
+                reached_distance = False
+                reached_overlap = False
+                valid_splices = []
+                nearest_join_distance = math.inf
+
+                for candidate_index in range(len(candidate_resampled) - 1):
+                    candidate_point = candidate_resampled[candidate_index]
+                    (
+                        distance,
+                        segment_index,
+                        join_point,
+                        projection_arc,
+                    ) = self._projection_with_arc(
+                        history,
+                        history_cumulative,
+                        candidate_point,
+                    )
+                    if projection_arc + tolerance < effective_commit:
+                        continue
+                    reached_commit = True
+                    nearest_join_distance = min(nearest_join_distance, distance)
+                    if distance > self.join_distance:
+                        continue
+                    reached_distance = True
+
+                    candidate_arc = float(
+                        candidate_cumulative[candidate_index]
+                    )
+                    if candidate_arc + tolerance < self.overlap_length:
+                        continue
+                    overlap_start_arc = candidate_arc - self.overlap_length
+                    overlap_start = max(
+                        0,
+                        int(
+                            np.searchsorted(
+                                candidate_cumulative,
+                                overlap_start_arc,
+                                side="right",
                             )
-                        except ValueError:
-                            candidate_for_join = None
-                            reason = "candidate_too_short"
-                    if candidate_for_join is not None:
-                        history_heading = (
-                            history[segment_index + 1]
-                            - history[segment_index]
                         )
-                        candidate_heading = (
-                            candidate_for_join[1] - candidate_for_join[0]
+                        - 1,
+                    )
+                    overlap_distances = []
+                    overlap_arcs = []
+                    for overlap_point in candidate_resampled[
+                        overlap_start : candidate_index + 1
+                    ]:
+                        (
+                            overlap_distance,
+                            _,
+                            _,
+                            overlap_arc,
+                        ) = self._projection_with_arc(
+                            history,
+                            history_cumulative,
+                            overlap_point,
                         )
+                        overlap_distances.append(overlap_distance)
+                        overlap_arcs.append(overlap_arc)
+                    overlap_error = max(overlap_distances)
+                    if overlap_error > self.overlap_distance:
+                        continue
+                    if np.any(np.diff(overlap_arcs) < -tolerance):
+                        continue
+                    if overlap_arcs[-1] <= overlap_arcs[0] + tolerance:
+                        continue
+                    reached_overlap = True
+
+                    candidate_for_join = candidate_resampled[
+                        candidate_index:
+                    ].copy()
+                    if distance <= self.point_spacing:
+                        candidate_for_join[0] = join_point
+                    try:
+                        candidate_for_join = self._normalize_polyline(
+                            candidate_for_join
+                        )
+                    except ValueError:
+                        continue
+
+                    history_heading = (
+                        history[segment_index + 1] - history[segment_index]
+                    )
+                    candidate_heading = (
+                        candidate_for_join[1] - candidate_for_join[0]
+                    )
+                    heading_deltas = [
+                        self._heading_delta(
+                            history_heading,
+                            candidate_heading,
+                        )
+                    ]
+                    if distance > self.point_spacing:
+                        connector_heading = candidate_for_join[0] - join_point
                         heading_deltas = [
                             self._heading_delta(
                                 history_heading,
+                                connector_heading,
+                            ),
+                            self._heading_delta(
+                                connector_heading,
                                 candidate_heading,
-                            )
+                            ),
                         ]
-                        if join_distance_m > self.point_spacing:
-                            connector_heading = candidate_for_join[0] - join_point
-                            heading_deltas = [
-                                self._heading_delta(
-                                    history_heading,
-                                    connector_heading,
-                                ),
-                                self._heading_delta(
-                                    connector_heading,
-                                    candidate_heading,
-                                ),
-                            ]
-                        if max(heading_deltas) > self.join_heading:
-                            reason = "join_heading"
-                        else:
-                            combined = self._normalize_polyline(
-                                np.vstack(
-                                    (
-                                        history[: segment_index + 1],
-                                        join_point,
-                                        candidate_for_join,
-                                    )
-                                )
+                    if max(heading_deltas) > self.join_heading:
+                        continue
+                    valid_splices.append(
+                        (
+                            projection_arc,
+                            candidate_arc,
+                            distance,
+                            segment_index,
+                            join_point,
+                            candidate_for_join,
+                            overlap_error,
+                        )
+                    )
+
+                if valid_splices:
+                    (
+                        preserved_length_m,
+                        _,
+                        join_distance_m,
+                        segment_index,
+                        join_point,
+                        candidate_for_join,
+                        overlap_error_m,
+                    ) = max(
+                        valid_splices,
+                        key=lambda splice: (splice[0], splice[1]),
+                    )
+                    combined = self._normalize_polyline(
+                        np.vstack(
+                            (
+                                history[: segment_index + 1],
+                                join_point,
+                                candidate_for_join,
                             )
-                            joined = self._resample_polyline(combined)
-                            if (
-                                self._polyline_length(joined)
-                                >= self.min_remaining
-                            ):
-                                active = joined
-                                accepted = True
-                                reason = "candidate_joined"
-                            else:
-                                reason = "candidate_too_short"
+                        )
+                    )
+                    joined = self._resample_polyline(combined)
+                    if self._polyline_length(joined) >= self.min_remaining:
+                        active = joined
+                        accepted = True
+                        reason = "candidate_joined"
+                    else:
+                        preserved_length_m = 0.0
+                        overlap_error_m = None
+                        reason = "candidate_too_short"
+                elif not reached_commit:
+                    reason = "join_commit_horizon"
+                elif not reached_distance:
+                    join_distance_m = (
+                        None
+                        if not np.isfinite(nearest_join_distance)
+                        else nearest_join_distance
+                    )
+                    reason = "join_distance"
+                elif not reached_overlap:
+                    reason = "join_overlap"
+                else:
+                    reason = "join_heading"
 
         if active is None and had_history and candidate_world_xy is None:
             reason = "history_exhausted"
@@ -171,6 +291,8 @@ class TrajectoryManager:
             candidate_accepted=accepted,
             reason=reason,
             join_distance_m=join_distance_m,
+            preserved_length_m=preserved_length_m,
+            overlap_error_m=overlap_error_m,
             remaining_length_m=remaining,
         )
 
@@ -200,6 +322,12 @@ class TrajectoryManager:
     def _polyline_length(points: np.ndarray) -> float:
         return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
 
+    @staticmethod
+    def _cumulative_lengths(points: np.ndarray) -> np.ndarray:
+        return np.concatenate(
+            ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+        )
+
     def _resample_polyline(self, points: np.ndarray) -> np.ndarray:
         segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
         cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
@@ -217,10 +345,15 @@ class TrajectoryManager:
         )
 
     @staticmethod
-    def _closest_projection(polyline: np.ndarray, point: np.ndarray):
-        best = (math.inf, 0, polyline[0])
+    def _projection_with_arc(
+        polyline: np.ndarray,
+        cumulative: np.ndarray,
+        point: np.ndarray,
+    ):
+        best = (math.inf, 0, polyline[0], 0.0)
         for index, (start, end) in enumerate(zip(polyline[:-1], polyline[1:])):
             segment = end - start
+            segment_length = float(np.linalg.norm(segment))
             fraction = float(
                 np.clip(
                     np.dot(point - start, segment) / np.dot(segment, segment),
@@ -231,8 +364,20 @@ class TrajectoryManager:
             projection = start + fraction * segment
             distance = float(np.linalg.norm(point - projection))
             if distance < best[0]:
-                best = (distance, index, projection)
+                projection_arc = float(
+                    cumulative[index] + fraction * segment_length
+                )
+                best = (distance, index, projection, projection_arc)
         return best
+
+    @classmethod
+    def _closest_projection(cls, polyline: np.ndarray, point: np.ndarray):
+        distance, index, projection, _ = cls._projection_with_arc(
+            polyline,
+            cls._cumulative_lengths(polyline),
+            point,
+        )
+        return distance, index, projection
 
     def _advance_history(self, chassis: np.ndarray):
         if self._active_traj is None:
