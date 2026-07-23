@@ -81,6 +81,10 @@ D435 当前视角下，模型给出的最近引导点可能仍离底盘较远。
 - 历史轨迹剩余不足 `0.20 m` 且没有可接纳候选时，控制原因变为
   `trajectory_missing` 并停车。
 
+为抑制模型候选在近场来回摆动，默认保留从底盘起始的稳定 `1.0 m` 前缀，
+只允许在其后的远端更新。新候选必须先与历史路径连续重叠至少 `0.5 m`，且该
+重叠段的最大路径误差不超过 `0.30 m`；否则候选被拒绝，继续执行已有历史轨迹。
+
 第一次还没有历史点时，管理器从底盘位置到模型首个引导点进行线性补点。
 连接规则可通过以下参数调整：
 
@@ -89,6 +93,9 @@ D435 当前视角下，模型给出的最近引导点可能仍离底盘较远。
 --trajectory-join-distance 0.50
 --trajectory-join-heading-deg 60.0
 --trajectory-min-remaining 0.20
+--trajectory-commit-horizon 1.0
+--trajectory-overlap-length 0.5
+--trajectory-overlap-distance 0.30
 ```
 
 红色轨迹表示实际交给 MPC 的 `active_traj`；按 critic 着色的轨迹仍表示模型
@@ -211,7 +218,9 @@ MPC BEV 视频的图层从下到上包括绿色 `actual` 实走里程计、红�
 点是 `TrajectoryManager.active_traj` 在送入 MPC 稠密化前的 `0.05 m` 离散
 路径，不是 MPC 控制器内部的稠密 `ref_traj`；第一个较大点表示底盘锚点。只有
 MPC 快照新鲜且里程计为 `ODOM OK` 时才显示红色 MPC 预测和黄色引导点；里程计
-过期时两者都会隐藏，避免在过期坐标系中显示路径。
+过期时两者都会隐藏，避免在过期坐标系中显示路径。黄色路径（以及所有 odom
+坐标系路径）使用该 RGB-D 帧捕获时的里程计位姿变换到相机当前底盘坐标，而不是
+渲染时更新的 live odom；live odom 的时间戳仍用于新鲜度判定。
 
 相关渲染器和客户端源代码测试：
 
@@ -245,7 +254,8 @@ PYTHONPATH=.. python3 -m unittest \
 ```
 
 `plan` 行记录模型候选、实际 `active_traj`、候选接纳结果、拼接距离、剩余
-轨迹长度、规划时的 odom/相机位姿、critic 和规划耗时；
+轨迹长度、保留历史长度 `trajectory_preserved_length_m`、重叠误差
+`trajectory_overlap_error_m`、规划时的 odom/相机位姿、critic 和规划耗时；
 `control` 行按控制周期记录 odom 位姿与实测速度、发送的 `v/w`、MPC 参考状态、
 预测状态、求解耗时及 frame/odom/plan 数据年龄。其中
 `desired_velocity=[linear_x, angular_z]` 是期望/发布速度，

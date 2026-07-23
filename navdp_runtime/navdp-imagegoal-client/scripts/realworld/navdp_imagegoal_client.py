@@ -160,6 +160,9 @@ class NavdpImageGoalClient(Node):
             join_distance=args.trajectory_join_distance,
             join_heading_degrees=args.trajectory_join_heading_deg,
             min_remaining=args.trajectory_min_remaining,
+            commit_horizon=args.trajectory_commit_horizon,
+            overlap_length=args.trajectory_overlap_length,
+            overlap_distance=args.trajectory_overlap_distance,
         )
         self.data_lock = threading.Lock()
         self.mpc_lock = threading.Lock()
@@ -749,6 +752,12 @@ class NavdpImageGoalClient(Node):
                         "trajectory_remaining_length_m": (
                             trajectory_update.remaining_length_m
                         ),
+                        "trajectory_preserved_length_m": (
+                            trajectory_update.preserved_length_m
+                        ),
+                        "trajectory_overlap_error_m": (
+                            trajectory_update.overlap_error_m
+                        ),
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
                         ),
@@ -756,15 +765,19 @@ class NavdpImageGoalClient(Node):
                 )
                 self.get_logger().info(
                     "active trajectory: reason=%s accepted=%s points=%d "
-                    "remaining=%.3f join=%s"
+                    "remaining=%.3f preserved=%.3f join=%s overlap_error=%s"
                     % (
                         trajectory_update.reason,
                         trajectory_update.candidate_accepted,
                         len(active_traj),
                         trajectory_update.remaining_length_m,
+                        trajectory_update.preserved_length_m,
                         "nan"
                         if trajectory_update.join_distance_m is None
                         else f"{trajectory_update.join_distance_m:.3f}",
+                        "nan"
+                        if trajectory_update.overlap_error_m is None
+                        else f"{trajectory_update.overlap_error_m:.3f}",
                     )
                 )
 
@@ -879,10 +892,12 @@ class NavdpImageGoalClient(Node):
         self.visualization_video_writer.write(visualization)
 
     def _render_mpc_bev(self, snapshot: FrameSnapshot) -> np.ndarray:
+        frame_odom = (
+            None
+            if snapshot.odom_xy_yaw is None
+            else snapshot.odom_xy_yaw.copy()
+        )
         with self.data_lock:
-            current_odom = (
-                None if self.latest_odom is None else self.latest_odom.copy()
-            )
             last_odom_time = self.last_odom_time
             odom_history = np.asarray(
                 list(self.odom_history),
@@ -901,7 +916,7 @@ class NavdpImageGoalClient(Node):
         )
         odom_status, mpc_fresh, mpc_status = bev_freshness(
             now=now,
-            current_odom=current_odom,
+            current_odom=frame_odom,
             last_odom_time=last_odom_time,
             mpc_updated_at=mpc_updated_at,
             odom_timeout=self.args.odom_timeout,
@@ -921,18 +936,18 @@ class NavdpImageGoalClient(Node):
             actual_velocity = None
 
         return render_mpc_rgb_bev(
-            snapshot.rgb_bgr,
-            snapshot.depth_m,
-            snapshot.intrinsic,
-            snapshot.base_from_camera,
-            current_odom,
-            odom_history,
-            predicted_states,
-            command,
-            solve_ms,
-            odom_status,
-            mpc_status,
-            self.bev_config,
+            rgb_bgr=snapshot.rgb_bgr,
+            depth_m=snapshot.depth_m,
+            intrinsic=snapshot.intrinsic,
+            base_from_camera=snapshot.base_from_camera,
+            current_odom_xy_yaw=frame_odom,
+            odom_history=odom_history,
+            predicted_states=predicted_states,
+            command=command,
+            solve_ms=solve_ms,
+            odom_status=odom_status,
+            mpc_status=mpc_status,
+            config=self.bev_config,
             actual_velocity=actual_velocity,
             active_traj=active_traj,
         )
@@ -1232,6 +1247,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-join-distance", type=float, default=0.50)
     parser.add_argument("--trajectory-join-heading-deg", type=float, default=60.0)
     parser.add_argument("--trajectory-min-remaining", type=float, default=0.20)
+    parser.add_argument("--trajectory-commit-horizon", type=float, default=1.0)
+    parser.add_argument("--trajectory-overlap-length", type=float, default=0.5)
+    parser.add_argument("--trajectory-overlap-distance", type=float, default=0.30)
     parser.add_argument("--arrival-distance", type=float, default=0.2)
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)

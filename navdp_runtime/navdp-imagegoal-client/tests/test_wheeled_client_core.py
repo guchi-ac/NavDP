@@ -1441,6 +1441,16 @@ class RosClientSourceTests(unittest.TestCase):
             '--trajectory-join-distance", type=float, default=0.50',
             '--trajectory-join-heading-deg", type=float, default=60.0',
             '--trajectory-min-remaining", type=float, default=0.20',
+            '--trajectory-commit-horizon", type=float, default=1.0',
+            '--trajectory-overlap-length", type=float, default=0.5',
+            '--trajectory-overlap-distance", type=float, default=0.30',
+        ):
+            self.assertIn(required, source)
+
+        for required in (
+            "commit_horizon=args.trajectory_commit_horizon",
+            "overlap_length=args.trajectory_overlap_length",
+            "overlap_distance=args.trajectory_overlap_distance",
         ):
             self.assertIn(required, source)
 
@@ -1456,8 +1466,61 @@ class RosClientSourceTests(unittest.TestCase):
             "trajectory_update.join_distance_m",
             '"trajectory_remaining_length_m"',
             "trajectory_update.remaining_length_m",
+            '"trajectory_preserved_length_m"',
+            "trajectory_update.preserved_length_m",
+            '"trajectory_overlap_error_m"',
+            "trajectory_update.overlap_error_m",
         ):
             self.assertIn(required, source)
+
+    def test_bev_uses_rgbd_snapshot_odom_as_the_render_pose(self):
+        source = self.client_source()
+        tree = ast.parse(source)
+        render_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_mpc_bev"
+        )
+        render_source = ast.get_source_segment(source, render_method)
+        self.assertIn(
+            "frame_odom = (\n"
+            "            None\n"
+            "            if snapshot.odom_xy_yaw is None\n"
+            "            else snapshot.odom_xy_yaw.copy()\n"
+            "        )",
+            render_source,
+        )
+
+        calls = [
+            node
+            for node in ast.walk(render_method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        freshness_call = next(
+            call for call in calls if call.func.id == "bev_freshness"
+        )
+        freshness_keywords = {
+            keyword.arg: keyword.value
+            for keyword in freshness_call.keywords
+            if keyword.arg is not None
+        }
+        self.assertIsInstance(freshness_keywords["current_odom"], ast.Name)
+        self.assertEqual(freshness_keywords["current_odom"].id, "frame_odom")
+
+        render_call = next(
+            call for call in calls if call.func.id == "render_mpc_rgb_bev"
+        )
+        render_keywords = {
+            keyword.arg: keyword.value
+            for keyword in render_call.keywords
+            if keyword.arg is not None
+        }
+        self.assertIsInstance(
+            render_keywords["current_odom_xy_yaw"], ast.Name
+        )
+        self.assertEqual(
+            render_keywords["current_odom_xy_yaw"].id, "frame_odom"
+        )
 
     def test_client_records_synchronized_mpc_diagnostics(self):
         client_path = (
