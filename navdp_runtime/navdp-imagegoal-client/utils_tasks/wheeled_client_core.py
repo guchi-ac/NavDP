@@ -605,7 +605,7 @@ def control_stop_reason(
     now: float,
     enable_control: bool,
     arrival_blocked: bool,
-    critic_safe: bool,
+    trajectory_ready: bool,
     last_frame_time: Optional[float],
     last_odom_time: Optional[float],
     last_plan_time: Optional[float],
@@ -617,8 +617,8 @@ def control_stop_reason(
         return "control_disabled"
     if arrival_blocked:
         return "arrival"
-    if not critic_safe:
-        return "critic"
+    if not trajectory_ready:
+        return "trajectory_missing"
     for name, timestamp, timeout in (
         ("frame", last_frame_time, frame_timeout),
         ("odom", last_odom_time, odom_timeout),

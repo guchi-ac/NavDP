@@ -567,7 +567,7 @@ class ControlDeadmanTests(unittest.TestCase):
             now=10.0,
             enable_control=True,
             arrival_blocked=False,
-            critic_safe=True,
+            trajectory_ready=True,
             last_frame_time=9.9,
             last_odom_time=9.9,
             last_plan_time=9.9,
@@ -588,12 +588,15 @@ class ControlDeadmanTests(unittest.TestCase):
 
     def test_stops_for_arrival_before_other_checks(self):
         self.assertEqual(
-            self.reason(arrival_blocked=True, critic_safe=False),
+            self.reason(arrival_blocked=True, trajectory_ready=False),
             "arrival",
         )
 
-    def test_stops_for_low_critic(self):
-        self.assertEqual(self.reason(critic_safe=False), "critic")
+    def test_stops_when_active_trajectory_is_missing(self):
+        self.assertEqual(
+            self.reason(trajectory_ready=False),
+            "trajectory_missing",
+        )
 
     def test_stops_for_missing_or_stale_inputs(self):
         cases = (
