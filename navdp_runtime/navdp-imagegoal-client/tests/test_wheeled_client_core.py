@@ -22,6 +22,38 @@ from utils_tasks.wheeled_client_core import (
 
 
 class GeometryTests(unittest.TestCase):
+    def test_accepted_candidate_replaces_installed_selected_diffusion(self):
+        installed = np.array([[0.0, 0.0], [1.0, 0.0]])
+        candidate = np.array([[0.5, 0.2], [1.5, 0.4]])
+
+        result = client_core.update_installed_selected_diffusion(
+            installed,
+            candidate,
+            candidate_accepted=True,
+        )
+
+        np.testing.assert_array_equal(result, candidate)
+        self.assertFalse(result.flags.writeable)
+        self.assertIsNot(result, candidate)
+        candidate[0] = [9.0, 9.0]
+        np.testing.assert_array_equal(result, [[0.5, 0.2], [1.5, 0.4]])
+
+    def test_rejected_candidate_retains_installed_selected_diffusion(self):
+        installed = np.array([[0.0, 0.0], [1.0, 0.0]])
+        rejected = np.array([[0.5, 1.0], [1.5, 1.0]])
+
+        result = client_core.update_installed_selected_diffusion(
+            installed,
+            rejected,
+            candidate_accepted=False,
+        )
+
+        np.testing.assert_array_equal(result, installed)
+        self.assertFalse(result.flags.writeable)
+        self.assertIsNot(result, installed)
+        installed[0] = [9.0, 9.0]
+        np.testing.assert_array_equal(result, [[0.0, 0.0], [1.0, 0.0]])
+
     def test_pitch20_d435_mount_points_rgb_optical_axis_down_20_degrees(self):
         base_from_mount = client_core.transform_matrix_from_translation_quaternion(
             translation_xyz=np.array([0.092070325, 0.0, 1.254818867]),
@@ -1698,15 +1730,21 @@ class RosClientSourceTests(unittest.TestCase):
 
         for required in (
             "active_traj: np.ndarray",
+            "selected_diffusion: Optional[np.ndarray]",
             "self.installed_active_traj: Optional[np.ndarray] = None",
+            "self.installed_selected_diffusion: Optional[np.ndarray] = None",
             "self.installed_active_traj = np.asarray(active_traj).copy()",
             "self.installed_active_traj.setflags(write=False)",
             "active_traj_snapshot = self.installed_active_traj.copy()",
             "active_traj_snapshot.setflags(write=False)",
             "active_traj=active_traj_snapshot",
+            "selected_diffusion=selected_diffusion_snapshot",
             "active_traj = None",
+            "selected_diffusion = None",
             "active_traj = mpc_snapshot.active_traj",
+            "selected_diffusion = mpc_snapshot.selected_diffusion",
             "active_traj=active_traj",
+            "selected_diffusion=selected_diffusion",
         ):
             self.assertIn(required, source)
 
@@ -1716,9 +1754,62 @@ class RosClientSourceTests(unittest.TestCase):
         active_traj_assignment = render_source.index(
             "active_traj = mpc_snapshot.active_traj"
         )
+        selected_assignment = render_source.index(
+            "selected_diffusion = mpc_snapshot.selected_diffusion"
+        )
         render_call = render_source.index("active_traj=active_traj")
+        selected_render_call = render_source.index(
+            "selected_diffusion=selected_diffusion"
+        )
         self.assertLess(fresh_block_start, active_traj_assignment)
+        self.assertLess(fresh_block_start, selected_assignment)
         self.assertLess(active_traj_assignment, render_call)
+        self.assertLess(selected_assignment, selected_render_call)
+
+    def test_client_updates_selected_only_after_successful_mpc_install(self):
+        source = self.client_source()
+        tree = ast.parse(source)
+        planning_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_planning_loop"
+        )
+        install_try = next(
+            node
+            for node in ast.walk(planning_method)
+            if isinstance(node, ast.Try)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "Mpc_controller"
+                for call in ast.walk(node)
+            )
+        )
+        install_calls = [
+            call
+            for call in ast.walk(install_try)
+            if isinstance(call, ast.Call)
+        ]
+        mpc_install_lines = [
+            call.lineno
+            for call in install_calls
+            if (
+                isinstance(call.func, ast.Name)
+                and call.func.id == "Mpc_controller"
+            )
+            or (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "update_ref_traj"
+            )
+        ]
+        selected_update = next(
+            call
+            for call in install_calls
+            if isinstance(call.func, ast.Name)
+            and call.func.id == "update_installed_selected_diffusion"
+        )
+
+        self.assertGreater(selected_update.lineno, max(mpc_install_lines))
 
     def test_client_hides_odom_frame_paths_when_odom_is_stale_but_mpc_is_fresh(self):
         source = self.client_source()
@@ -1740,6 +1831,10 @@ class RosClientSourceTests(unittest.TestCase):
         ]
         self.assertIn("predicted_states = mpc_snapshot.predicted_states", guarded_paths)
         self.assertIn("active_traj = mpc_snapshot.active_traj", guarded_paths)
+        self.assertIn(
+            "selected_diffusion = mpc_snapshot.selected_diffusion",
+            guarded_paths,
+        )
 
     def test_client_queues_bev_frames_before_odom_or_plan_exists(self):
         client_path = (

@@ -68,6 +68,7 @@ from utils_tasks.wheeled_client_core import (
     run_navdp_startup,
     trajectory_to_world,
     transform_matrix_from_translation_quaternion,
+    update_installed_selected_diffusion,
     yaw_from_quaternion,
 )
 
@@ -104,6 +105,7 @@ class VisualizationRequest:
 class MpcVisualizationSnapshot:
     predicted_states: np.ndarray
     active_traj: np.ndarray
+    selected_diffusion: Optional[np.ndarray]
     command: np.ndarray
     solve_ms: float
     updated_at: float
@@ -173,6 +175,7 @@ class NavdpImageGoalClient(Node):
         self.frame_sequence = 0
         self.mpc = None
         self.installed_active_traj: Optional[np.ndarray] = None
+        self.installed_selected_diffusion: Optional[np.ndarray] = None
         self.last_plan_time = None
         self.plan_sequence = 0
         self.latest_plan_id = None
@@ -675,6 +678,8 @@ class NavdpImageGoalClient(Node):
                 else trajectory_update.active_traj
             )
             if active_traj is None:
+                with self.mpc_lock:
+                    self.installed_selected_diffusion = None
                 with self.data_lock:
                     self.trajectory_ready = False
                 if trajectory_update is not None:
@@ -706,6 +711,13 @@ class NavdpImageGoalClient(Node):
                             )
                         self.installed_active_traj = np.asarray(active_traj).copy()
                         self.installed_active_traj.setflags(write=False)
+                        self.installed_selected_diffusion = (
+                            update_installed_selected_diffusion(
+                                self.installed_selected_diffusion,
+                                retained_world_xy,
+                                trajectory_update.candidate_accepted,
+                            )
+                        )
                 except Exception as error:
                     with self.data_lock:
                         self.trajectory_ready = False
@@ -947,6 +959,7 @@ class NavdpImageGoalClient(Node):
         )
         predicted_states = None
         active_traj = None
+        selected_diffusion = None
         command = np.zeros(2, dtype=np.float64)
         solve_ms = None
         if mpc_fresh:
@@ -955,6 +968,7 @@ class NavdpImageGoalClient(Node):
         if mpc_fresh and odom_status == "ODOM OK":
             predicted_states = mpc_snapshot.predicted_states
             active_traj = mpc_snapshot.active_traj
+            selected_diffusion = mpc_snapshot.selected_diffusion
         if odom_status != "ODOM OK":
             actual_velocity = None
 
@@ -973,6 +987,7 @@ class NavdpImageGoalClient(Node):
             config=self.bev_config,
             actual_velocity=actual_velocity,
             active_traj=active_traj,
+            selected_diffusion=selected_diffusion,
         )
 
     def _append_mpc_bev_video(self, snapshot: FrameSnapshot) -> None:
@@ -1076,6 +1091,13 @@ class NavdpImageGoalClient(Node):
                             ) * 1000.0
                             active_traj_snapshot = self.installed_active_traj.copy()
                             active_traj_snapshot.setflags(write=False)
+                            selected_diffusion_snapshot = (
+                                None
+                                if self.installed_selected_diffusion is None
+                                else self.installed_selected_diffusion.copy()
+                            )
+                            if selected_diffusion_snapshot is not None:
+                                selected_diffusion_snapshot.setflags(write=False)
                     if reason is None:
                         linear = float(np.clip(controls[0, 0], 0.0, self.args.max_v))
                         angular = float(
@@ -1093,6 +1115,7 @@ class NavdpImageGoalClient(Node):
                                 MpcVisualizationSnapshot(
                                     predicted_states=predicted_snapshot,
                                     active_traj=active_traj_snapshot,
+                                    selected_diffusion=selected_diffusion_snapshot,
                                     command=command_snapshot,
                                     solve_ms=float(solve_ms),
                                     updated_at=time.monotonic(),

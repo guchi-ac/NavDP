@@ -27,6 +27,19 @@ class TrajectoryUpdate:
     manager_update_ms: float
 
 
+def update_installed_selected_diffusion(
+    installed,
+    candidate_world_xy,
+    candidate_accepted: bool,
+) -> Optional[np.ndarray]:
+    selected = candidate_world_xy if candidate_accepted else installed
+    if selected is None:
+        return None
+    result = np.asarray(selected, dtype=np.float64).copy()
+    result.setflags(write=False)
+    return result
+
+
 class TrajectoryManager:
     """Maintain a stable odometry-frame guide path for MPC."""
 
