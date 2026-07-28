@@ -60,10 +60,10 @@ from utils_tasks.wheeled_client_core import (
     JsonlWriter,
     PostureActionRunner,
     SelectedDiffusionInstallState,
-    TrajectoryManager,
     camera_pose_from_transform,
     control_stop_reason,
     finalize_mp4,
+    normalize_tracking_trajectory,
     put_latest,
     reproject_navdp_to_ground_base,
     resize_rgbd_for_visualization,
@@ -164,12 +164,6 @@ class NavdpImageGoalClient(Node):
                 min_inliers=args.min_inliers,
                 required_consecutive=args.arrival_consecutive,
             ),
-        )
-        self.trajectory_manager = TrajectoryManager(
-            point_spacing=args.trajectory_point_spacing,
-            join_distance=args.trajectory_join_distance,
-            join_heading_degrees=args.trajectory_join_heading_deg,
-            min_remaining=args.trajectory_min_remaining,
         )
         self.data_lock = threading.Lock()
         self.mpc_lock = threading.Lock()
@@ -529,7 +523,7 @@ class NavdpImageGoalClient(Node):
                 continue
             last_sequence = snapshot.sequence
 
-            trajectory_update = None
+            active_traj = None
             critic_max = None
             critic_safe = False
             local_xy = None
@@ -547,9 +541,6 @@ class NavdpImageGoalClient(Node):
             try:
                 if snapshot.odom_xy_yaw is None:
                     raise RuntimeError("no odometry snapshot for planned frame")
-                trajectory_update = self.trajectory_manager.update(
-                    snapshot.odom_xy_yaw[:2]
-                )
                 arrival = self.verifier.update(
                     snapshot.rgb_bgr,
                     snapshot.depth_m,
@@ -672,17 +663,13 @@ class NavdpImageGoalClient(Node):
                         for candidate in candidate_local
                     ]
                 )
-                if retained_reprojected_world_xy is None:
-                    trajectory_update = self.trajectory_manager.update(
-                        snapshot.odom_xy_yaw[:2]
+                if (
+                    retained_reprojected_world_xy is not None
+                    and critic_safe
+                ):
+                    active_traj = normalize_tracking_trajectory(
+                        retained_reprojected_world_xy
                     )
-                else:
-                    trajectory_update = self.trajectory_manager.update(
-                        snapshot.odom_xy_yaw[:2],
-                        candidate_world_xy=retained_reprojected_world_xy,
-                        candidate_eligible=critic_safe,
-                    )
-                active_traj = trajectory_update.active_traj
                 self.visualization_state = VisualizationState(
                     trajectory=(
                         np.empty((0, 2), dtype=np.float64)
@@ -702,48 +689,32 @@ class NavdpImageGoalClient(Node):
                         reprojection_log_time - self.last_reprojection_error_log >= 2.0
                     ):
                         self.get_logger().warning(
-                            "NavDP virtual reprojection rejected: %s active=%s"
-                            % (
-                                reprojection_error,
-                                "retained"
-                                if active_traj is not None
-                                else "unavailable",
-                            )
+                            "NavDP virtual reprojection rejected: %s"
+                            % reprojection_error
                         )
                         self.last_reprojection_error_log = reprojection_log_time
                 if not critic_safe:
                     self.get_logger().warning(
                         "NavDP candidate below critic threshold: "
-                        "max=%.3f threshold=%.3f active=%s"
+                        "max=%.3f threshold=%.3f"
                         % (
                             critic_max,
                             self.args.critic_threshold,
-                            "retained"
-                            if active_traj is not None
-                            else "unavailable",
                         )
                     )
             except Exception as error:
                 planning_error = error
                 self.get_logger().error(f"planning failed: {error}")
 
-            active_traj = (
-                None
-                if trajectory_update is None
-                else trajectory_update.active_traj
-            )
             if active_traj is None:
                 with self.mpc_lock:
                     self.selected_diffusion_state = (
                         self.selected_diffusion_state.clear()
                     )
+                    self.mpc = None
+                    self.installed_active_traj = None
                 with self.data_lock:
                     self.trajectory_ready = False
-                if trajectory_update is not None:
-                    self.get_logger().warning(
-                        "trajectory unavailable: reason=%s"
-                        % trajectory_update.reason
-                    )
                 self._write_diagnostic(
                     {
                         "type": "plan",
@@ -772,34 +743,27 @@ class NavdpImageGoalClient(Node):
                         self.selected_diffusion_state = (
                             self.selected_diffusion_state.stage(
                                 retained_raw_world_xy,
-                                trajectory_update.candidate_accepted,
+                                True,
                             )
                         )
-                        if (
-                            self.mpc is None
-                            or self.mpc.prediction_steps
-                            != trajectory_update.mpc_prediction_steps
-                        ):
-                            self.mpc = Mpc_controller(
-                                active_traj,
-                                N=trajectory_update.diffusion_point_count,
-                                blind_steps=trajectory_update.blind_point_count,
-                                desired_v=self.args.max_v,
-                                v_max=self.args.max_v,
-                                w_max=self.args.max_w,
-                            )
-                        else:
-                            self.mpc.update_ref_traj(
-                                active_traj,
-                                N=trajectory_update.diffusion_point_count,
-                                blind_steps=trajectory_update.blind_point_count,
-                            )
+                        self.mpc = Mpc_controller(
+                            active_traj,
+                            desired_v=self.args.max_v,
+                            v_max=self.args.max_v,
+                            w_max=self.args.max_w,
+                        )
                         self.installed_active_traj = np.asarray(active_traj).copy()
                         self.installed_active_traj.setflags(write=False)
                         self.selected_diffusion_state = (
                             self.selected_diffusion_state.commit()
                         )
                 except Exception as error:
+                    with self.mpc_lock:
+                        self.mpc = None
+                        self.installed_active_traj = None
+                        self.selected_diffusion_state = (
+                            self.selected_diffusion_state.clear()
+                        )
                     with self.data_lock:
                         self.trajectory_ready = False
                     reason = "active_trajectory_error"
@@ -848,69 +812,18 @@ class NavdpImageGoalClient(Node):
                         "reprojection_status": reprojection_status,
                         "reprojection_reason": reprojection_error,
                         "active_traj": active_traj,
-                        "candidate_accepted": trajectory_update.candidate_accepted,
-                        "trajectory_reason": trajectory_update.reason,
-                        "trajectory_join_distance_m": (
-                            trajectory_update.join_distance_m
-                        ),
-                        "trajectory_remaining_length_m": (
-                            trajectory_update.remaining_length_m
-                        ),
-                        "trajectory_blind_length_m": (
-                            trajectory_update.blind_length_m
-                        ),
-                        "trajectory_blind_point_count": (
-                            trajectory_update.blind_point_count
-                        ),
-                        "trajectory_diffusion_length_m": (
-                            trajectory_update.diffusion_length_m
-                        ),
-                        "trajectory_diffusion_point_count": (
-                            trajectory_update.diffusion_point_count
-                        ),
-                        "trajectory_diffusion_spacing_m": (
-                            trajectory_update.diffusion_spacing_m
-                        ),
-                        "trajectory_projection_advance_m": (
-                            trajectory_update.projection_advance_m
-                        ),
-                        "trajectory_blind_max_turn_deg": (
-                            trajectory_update.blind_max_turn_degrees
-                        ),
-                        "mpc_prediction_steps": (
-                            trajectory_update.mpc_prediction_steps
-                        ),
-                        "trajectory_manager_update_ms": (
-                            trajectory_update.manager_update_ms
-                        ),
+                        "mpc_horizon": self.mpc.N,
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
                         ),
                     }
                 )
                 self.get_logger().info(
-                    "active trajectory: reason=%s accepted=%s points=%d "
-                    "remaining=%.3f blind=%.3f blind_points=%d "
-                    "diffusion=%.3f diffusion_points=%d mpc_steps=%d "
-                    "spacing=%.3f advance=%.3f blind_turn=%.3f "
-                    "join=%s manager_ms=%.3f"
+                    "installed upstream NavDP trajectory: "
+                    "points=%d mpc_horizon=%d"
                     % (
-                        trajectory_update.reason,
-                        trajectory_update.candidate_accepted,
                         len(active_traj),
-                        trajectory_update.remaining_length_m,
-                        trajectory_update.blind_length_m,
-                        trajectory_update.blind_point_count,
-                        trajectory_update.diffusion_length_m,
-                        trajectory_update.diffusion_point_count,
-                        trajectory_update.mpc_prediction_steps,
-                        trajectory_update.diffusion_spacing_m,
-                        trajectory_update.projection_advance_m,
-                        trajectory_update.blind_max_turn_degrees,
-                        "nan"
-                        if trajectory_update.join_distance_m is None
-                        else f"{trajectory_update.join_distance_m:.3f}",
-                        trajectory_update.manager_update_ms,
+                        self.mpc.N,
                     )
                 )
 
@@ -1388,10 +1301,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-w", type=float, default=0.50)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
     parser.add_argument("--virtual-camera-height", type=float, default=0.2)
-    parser.add_argument("--trajectory-point-spacing", type=float, default=0.05)
-    parser.add_argument("--trajectory-join-distance", type=float, default=0.50)
-    parser.add_argument("--trajectory-join-heading-deg", type=float, default=60.0)
-    parser.add_argument("--trajectory-min-remaining", type=float, default=0.20)
     parser.add_argument("--arrival-distance", type=float, default=0.2)
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)

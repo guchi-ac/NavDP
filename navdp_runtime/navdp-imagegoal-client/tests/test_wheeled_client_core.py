@@ -182,6 +182,29 @@ class GeometryTests(unittest.TestCase):
                 base_from_camera=self.level_optical_transform(0.2),
             )
 
+    def test_normalizes_direct_tracking_trajectory_without_resampling(self):
+        trajectory = np.array(
+            [[0.5, 0.1], [0.5, 0.1], [1.0, 0.2], [1.5, 0.4]]
+        )
+
+        normalized = client_core.normalize_tracking_trajectory(trajectory)
+
+        np.testing.assert_array_equal(
+            normalized,
+            [[0.5, 0.1], [1.0, 0.2], [1.5, 0.4]],
+        )
+
+    def test_rejects_invalid_direct_tracking_trajectory(self):
+        for trajectory in (
+            np.array([[1.0, 0.0]]),
+            np.array([[1.0, 0.0], [1.0, 0.0]]),
+            np.array([[1.0, 0.0], [np.nan, 0.0]]),
+            np.array([1.0, 2.0]),
+        ):
+            with self.subTest(trajectory=trajectory):
+                with self.assertRaises(ValueError):
+                    client_core.normalize_tracking_trajectory(trajectory)
+
     def test_pending_selected_survives_failed_install_and_rejected_retry(self):
         old = np.array([[0.0, 0.0], [1.0, 0.0]])
         accepted = np.array([[0.5, 0.2], [1.5, 0.4]])
@@ -284,614 +307,6 @@ class GeometryTests(unittest.TestCase):
         )
 
 
-class TrajectoryManagerTests(unittest.TestCase):
-    def make_manager(self, **changes):
-        values = dict(
-            point_spacing=0.05,
-            join_distance=0.50,
-            join_heading_degrees=60.0,
-            min_remaining=0.20,
-        )
-        values.update(changes)
-        return client_core.TrajectoryManager(**values)
-
-    def test_blind_history_ends_at_current_candidate_first_point_projection(self):
-        manager = self.make_manager(point_spacing=0.10)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_replaced")
-        self.assertAlmostEqual(result.blind_length_m, 0.7)
-        self.assertEqual(result.diffusion_point_count, 3)
-        np.testing.assert_array_equal(
-            result.active_traj[-3:],
-            [[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]],
-        )
-
-    def test_blind_guides_use_current_diffusion_median_spacing(self):
-        manager = self.make_manager(point_spacing=0.05)
-        candidate = np.array(
-            [[0.60, 0.0], [0.75, 0.0], [0.90, 0.0], [1.05, 0.0]]
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        np.testing.assert_allclose(
-            result.active_traj[1:4],
-            [[0.15, 0.0], [0.30, 0.0], [0.45, 0.0]],
-            atol=1e-9,
-        )
-        self.assertEqual(result.blind_point_count, 3)
-        np.testing.assert_array_equal(result.active_traj[-4:], candidate)
-
-    def test_lateral_reanchoring_never_accumulates_projection_corners(self):
-        manager = self.make_manager(point_spacing=0.05)
-        candidate = np.array(
-            [[0.60, 0.0], [0.75, 0.0], [0.90, 0.0], [1.05, 0.0]]
-        )
-        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
-
-        for index in range(100):
-            result = manager.update([0.0, 0.01 if index % 2 else -0.01])
-
-        self.assertLessEqual(result.blind_point_count, 3)
-        self.assertLessEqual(len(result.active_traj), 1 + 3 + len(candidate))
-        blind_with_seams = np.vstack(
-            (
-                result.active_traj[: 1 + result.blind_point_count],
-                result.active_traj[-len(candidate)],
-            )
-        )
-        headings = np.arctan2(
-            np.diff(blind_with_seams[:, 1]),
-            np.diff(blind_with_seams[:, 0]),
-        )
-        turns = np.abs(
-            np.arctan2(
-                np.sin(np.diff(headings)),
-                np.cos(np.diff(headings)),
-            )
-        )
-        self.assertLess(
-            float(np.max(turns, initial=0.0)),
-            math.radians(15.0),
-        )
-
-    def test_chassis_projection_cannot_jump_across_self_crossing_centerline(self):
-        manager = self.make_manager(point_spacing=0.05)
-        candidate = np.array(
-            [
-                [0.30, 0.01],
-                [0.60, 0.30],
-                [0.30, 0.60],
-                [0.0, 0.30],
-                [0.30, 0.0],
-                [0.60, -0.30],
-            ]
-        )
-        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
-
-        result = manager.update([0.30, 0.0])
-
-        self.assertLessEqual(
-            result.projection_advance_m,
-            0.30 + result.diffusion_spacing_m + 1e-9,
-        )
-        np.testing.assert_array_equal(result.active_traj[0], [0.30, 0.0])
-
-    def test_fallback_prunes_passed_diffusion_points_without_reversing(self):
-        manager = self.make_manager(point_spacing=0.05)
-        candidate = np.array(
-            [[0.30, 0.0], [0.45, 0.0], [0.60, 0.0], [0.75, 0.0]]
-        )
-        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
-
-        result = manager.update([0.47, 0.0])
-
-        np.testing.assert_array_equal(
-            result.active_traj[-2:],
-            [[0.60, 0.0], [0.75, 0.0]],
-        )
-        self.assertEqual(result.diffusion_point_count, 2)
-        self.assertTrue(np.all(np.diff(result.active_traj[:, 0]) > 0.0))
-
-    def test_first_distinct_reference_is_forward_of_chassis(self):
-        manager = self.make_manager(point_spacing=0.05)
-        candidate = np.array(
-            [[0.60, 0.0], [0.75, 0.0], [0.90, 0.0]]
-        )
-        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
-
-        result = manager.update([0.02, 0.03])
-        first = next(
-            point
-            for point in result.active_traj[1:]
-            if np.linalg.norm(point - result.active_traj[0]) > 1e-9
-        )
-
-        self.assertGreater(
-            np.dot(first - result.active_traj[0], [1.0, 0.0]),
-            0.0,
-        )
-
-    def test_rejects_candidate_whose_first_sample_reverses_centerline_progress(self):
-        manager = self.make_manager(
-            point_spacing=0.05,
-            join_heading_degrees=180.0,
-        )
-        previous = manager.update(
-            [0.0, 0.0],
-            np.array(
-                [[0.2, 0.0], [0.2, 0.1], [-0.2, 0.1], [-0.4, 0.1]]
-            ),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[-0.2, 0.1], [-0.85, 0.1], [-1.5, 0.1]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_nonforward")
-        np.testing.assert_array_equal(
-            result.active_traj,
-            previous.active_traj,
-        )
-
-    def test_blind_history_is_not_capped_at_one_meter(self):
-        manager = self.make_manager(point_spacing=0.10)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0], [1.3, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.3, 0.0], [1.7, 0.3], [2.2, 0.6]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertAlmostEqual(result.blind_length_m, 1.3)
-
-    def test_complete_normalized_diffusion_candidate_is_preserved_exactly(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        candidate = np.array(
-            [[0.8, 0.0], [0.8, 0.0], [1.11, 0.17], [1.73, 0.61]]
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        expected = np.array([[0.8, 0.0], [1.11, 0.17], [1.73, 0.61]])
-        self.assertEqual(result.diffusion_point_count, len(expected))
-        np.testing.assert_array_equal(
-            result.active_traj[-len(expected) :],
-            expected,
-        )
-
-    def test_initial_candidate_samples_blind_connector_at_diffusion_spacing(self):
-        manager = self.make_manager(point_spacing=0.25)
-        candidate = np.array([[1.0, 0.0], [1.37, 0.23], [2.0, 0.7]])
-
-        result = manager.update(
-            [0.0, 0.0], candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertEqual(result.reason, "initialized")
-        expected_spacing = 0.5 * (
-            math.hypot(0.37, 0.23) + math.hypot(0.63, 0.47)
-        )
-        self.assertEqual(result.blind_point_count, 1)
-        self.assertEqual(result.diffusion_point_count, 3)
-        self.assertEqual(result.mpc_prediction_steps, 4)
-        np.testing.assert_allclose(
-            result.active_traj[1],
-            [expected_spacing, 0.0],
-            atol=1e-9,
-        )
-        np.testing.assert_array_equal(result.active_traj[-3:], candidate)
-        np.testing.assert_array_equal(result.active_traj[0], [0.0, 0.0])
-
-    def test_initial_candidate_at_chassis_has_zero_blind_guides(self):
-        manager = self.make_manager()
-        candidate = np.array([[0.0, 0.0], [1.0, 0.0]])
-
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.blind_point_count, 0)
-        self.assertEqual(result.blind_length_m, 0.0)
-        self.assertEqual(result.diffusion_point_count, 2)
-        np.testing.assert_array_equal(result.active_traj[-2:], candidate)
-
-    def test_replacement_candidate_at_chassis_has_zero_blind_guides(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        candidate = np.array([[0.0, 0.0], [1.0, 0.0]])
-
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.blind_point_count, 0)
-        self.assertEqual(result.blind_length_m, 0.0)
-        np.testing.assert_array_equal(result.active_traj[-2:], candidate)
-
-    def test_candidate_does_not_need_continuous_overlap(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.2, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [1.6, 0.6], [2.5, 1.2]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-
-    def test_projection_uses_original_history_polyline_at_sharp_corner(self):
-        manager = self.make_manager(join_heading_degrees=180.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.99, 0.0], [0.99, 1.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertAlmostEqual(
-            result.join_distance_m,
-            0.0,
-            places=7,
-        )
-
-    def test_old_path_advances_and_reanchors_at_chassis(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update([0.35, 0.02])
-
-        np.testing.assert_array_equal(result.active_traj[0], [0.35, 0.02])
-        self.assertGreater(result.active_traj[-1, 0], 1.9)
-
-    def test_rejects_distant_candidate_without_mutating_history(self):
-        manager = self.make_manager(join_distance=0.10)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.10, 0.0],
-            np.array([[1.1, 1.0], [2.1, 1.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "join_distance")
-        self.assertLess(np.max(np.abs(result.active_traj[:, 1])), 0.11)
-
-    def test_rejects_heading_discontinuity(self):
-        manager = self.make_manager(join_heading_degrees=30.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [1.0, 1.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "join_heading")
-
-    def test_rejects_lateral_join_bridge_despite_matching_path_headings(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.4], [2.0, 0.4]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "join_heading")
-
-    def test_short_join_uses_path_headings_without_altering_candidate(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.05], [2.0, 0.05]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        np.testing.assert_array_equal(
-            result.active_traj[-2:],
-            [[1.0, 0.05], [2.0, 0.05]],
-        )
-        self.assertEqual(result.blind_point_count, 0)
-        np.testing.assert_array_equal(
-            result.active_traj,
-            [[0.0, 0.0], [1.0, 0.05], [2.0, 0.05]],
-        )
-
-    def test_candidate_join_prunes_history_points_within_current_spacing(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array(
-                [
-                    [0.40, 0.0],
-                    [0.80, 0.0],
-                    [0.90, 0.02],
-                    [1.00, 0.0],
-                    [1.50, 0.0],
-                ]
-            ),
-            candidate_eligible=True,
-        )
-        candidate = np.array(
-            [[1.00, 0.05], [1.40, 0.05], [1.80, 0.05]]
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        np.testing.assert_array_equal(result.active_traj[-3:], candidate)
-        candidate_index = next(
-            index
-            for index, point in enumerate(manager._history_centerline)
-            if np.array_equal(point, candidate[0])
-        )
-        previous_history_point = manager._history_centerline[
-            candidate_index - 1
-        ]
-        self.assertGreaterEqual(
-            np.linalg.norm(candidate[0] - previous_history_point),
-            result.diffusion_spacing_m - 1e-9,
-        )
-
-    def test_low_critic_candidate_retains_history_until_exhausted(self):
-        manager = self.make_manager(min_remaining=0.20)
-        initialized = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        retained = manager.update(
-            [0.50, 0.0],
-            np.array([[0.5, 1.0], [1.0, 1.0]]),
-            candidate_eligible=False,
-        )
-        exhausted = manager.update([0.95, 0.0])
-
-        self.assertEqual(retained.reason, "candidate_low_critic")
-        self.assertIsNotNone(retained.active_traj)
-        self.assertEqual(
-            retained.mpc_prediction_steps,
-            initialized.mpc_prediction_steps,
-        )
-        self.assertIsNone(exhausted.active_traj)
-        self.assertEqual(exhausted.reason, "history_exhausted")
-        self.assertEqual(exhausted.mpc_prediction_steps, 0)
-
-    def test_history_exhausts_when_chassis_has_overshot_terminal_point(self):
-        manager = self.make_manager(min_remaining=0.20)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update([1.30, 0.0])
-
-        self.assertIsNone(result.active_traj)
-        self.assertEqual(result.reason, "history_exhausted")
-
-    def test_history_exhaustion_ignores_lateral_correction_near_terminal(self):
-        manager = self.make_manager(min_remaining=0.20)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update([0.95, 0.30])
-
-        self.assertIsNone(result.active_traj)
-        self.assertEqual(result.reason, "history_exhausted")
-
-    def test_invalid_candidate_retains_history(self):
-        manager = self.make_manager()
-        initialized = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.10, 0.0],
-            np.array([[math.nan, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertEqual(result.reason, "candidate_invalid")
-        self.assertIsNotNone(result.active_traj)
-        self.assertEqual(
-            result.diffusion_point_count,
-            initialized.diffusion_point_count,
-        )
-
-    def test_tiny_candidate_does_not_replace_healthy_history(self):
-        manager = self.make_manager(min_remaining=0.20)
-        previous = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.01, 0.0], [0.011, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_too_short")
-        np.testing.assert_array_equal(
-            result.active_traj,
-            previous.active_traj,
-        )
-        self.assertEqual(
-            result.mpc_prediction_steps,
-            previous.mpc_prediction_steps,
-        )
-
-    def test_result_does_not_allow_mutating_manager_state(self):
-        manager = self.make_manager()
-        first = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        with self.assertRaises(ValueError):
-            first.active_traj[0] = [99.0, 99.0]
-        second = manager.update([0.10, 0.0])
-
-        self.assertLess(second.active_traj[0, 0], 1.0)
-
-    def test_constructor_parameters_must_be_positive_and_finite(self):
-        for parameter in (
-            "point_spacing",
-            "join_distance",
-            "join_heading_degrees",
-            "min_remaining",
-        ):
-            for value in (0.0, -1.0, math.nan, math.inf):
-                with self.subTest(parameter=parameter, value=value):
-                    with self.assertRaises(ValueError):
-                        self.make_manager(**{parameter: value})
-
-    def test_update_reports_dynamic_lengths_counts_and_timing(self):
-        manager = self.make_manager(point_spacing=0.20)
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertAlmostEqual(result.blind_length_m, 1.0)
-        self.assertEqual(result.blind_point_count, 0)
-        self.assertAlmostEqual(result.diffusion_length_m, 2.0)
-        self.assertEqual(result.diffusion_point_count, 2)
-        self.assertEqual(result.mpc_prediction_steps, 2)
-        self.assertAlmostEqual(result.remaining_length_m, 3.0)
-        self.assertGreaterEqual(result.manager_update_ms, 0.0)
-
-    def test_candidate_must_have_two_distinct_finite_points(self):
-        manager = self.make_manager()
-        for candidate in (
-            np.array([[1.0, 0.0]]),
-            np.array([[1.0, 0.0], [1.0, 0.0]]),
-            np.array([[math.nan, 0.0], [2.0, 0.0]]),
-        ):
-            with self.subTest(candidate=candidate):
-                result = manager.update(
-                    [0.0, 0.0],
-                    candidate,
-                    candidate_eligible=True,
-                )
-                self.assertFalse(result.candidate_accepted)
-                self.assertEqual(result.reason, "candidate_invalid")
-
-    def test_seventy_point_update_completes_within_realtime_budget(self):
-        manager = self.make_manager()
-        x = np.linspace(1.0, 4.5, 70)
-        manager.update(
-            [0.0, 0.0],
-            np.column_stack((x, np.zeros_like(x))),
-            candidate_eligible=True,
-        )
-
-        start = time.perf_counter()
-        result = manager.update(
-            [0.1, 0.0],
-            np.column_stack((x + 0.1, 0.05 * np.sin(x))),
-            candidate_eligible=True,
-        )
-        elapsed = time.perf_counter() - start
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertLess(elapsed, 0.2)
-        self.assertLess(result.manager_update_ms, 200.0)
 
 
 class PostureGoalTests(unittest.TestCase):
@@ -1421,7 +836,7 @@ class RosClientSourceTests(unittest.TestCase):
         )
         return client_path.read_text(encoding="utf-8")
 
-    def test_client_routes_reprojected_path_to_manager_but_snapshots_raw_selected(self):
+    def test_client_tracks_reprojected_path_directly_but_snapshots_raw_selected(self):
         source = self.client_source()
 
         for required in (
@@ -1431,28 +846,29 @@ class RosClientSourceTests(unittest.TestCase):
             "reprojected_world_xy",
             "retained_raw_world_xy",
             "retained_reprojected_world_xy",
-            "candidate_world_xy=retained_reprojected_world_xy",
+            "normalize_tracking_trajectory(\n"
+            "                        retained_reprojected_world_xy\n"
+            "                    )",
             "self.selected_diffusion_state.stage(\n"
             "                                retained_raw_world_xy,",
         ):
             self.assertIn(required, source)
+        self.assertNotIn("TrajectoryManager", source)
+        self.assertNotIn("trajectory_manager.update", source)
         self.assertNotIn(
             "candidate_world_xy=retained_raw_world_xy",
             source,
         )
 
-    def test_invalid_reprojection_advances_manager_without_new_candidate(self):
+    def test_invalid_reprojection_does_not_retain_an_old_trajectory(self):
         source = self.client_source()
 
         self.assertIn("reprojection_error = None", source)
         self.assertIn("except ValueError as error:", source)
         self.assertIn("reprojection_error = str(error)", source)
-        self.assertIn(
-            "self.trajectory_manager.update(\n"
-            "                        snapshot.odom_xy_yaw[:2]\n"
-            "                    )",
-            source,
-        )
+        self.assertIn("retained_reprojected_world_xy = None", source)
+        self.assertIn("self.installed_active_traj = None", source)
+        self.assertNotIn("trajectory_manager.update", source)
 
     def test_client_exposes_virtual_camera_height_default(self):
         source = self.client_source()
@@ -1687,7 +1103,7 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_controller_copy_records_internnav_mit_provenance(self):
+    def test_controller_copy_records_upstream_navdp_provenance(self):
         controller_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -1697,11 +1113,11 @@ class RosClientSourceTests(unittest.TestCase):
 
         source = controller_path.read_text(encoding="utf-8")
 
-        self.assertIn("InternRobotics/InternNav", source)
-        self.assertIn("MIT License", source)
+        self.assertIn("InternRobotics/NavDP", source)
+        self.assertIn("bebb436a9856acbd6ed2a63234a99db6bac2fd3a", source)
         self.assertIn("class Mpc_controller", source)
 
-    def test_controller_cost_tracks_reference_yaw(self):
+    def test_controller_cost_matches_upstream_zero_yaw_reference(self):
         controller_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -1710,9 +1126,10 @@ class RosClientSourceTests(unittest.TestCase):
         )
         source = controller_path.read_text(encoding="utf-8")
 
-        self.assertIn("Q = np.diag([10.0, 10.0, 5.0])", source)
-        self.assertIn("reference_poses_from_xy(ref_traj, x0[2])", source)
-        self.assertNotIn("np.zeros((ref_traj.shape[0], 1))", source)
+        self.assertIn("Q = np.diag([10.0, 10.0, 0.0])", source)
+        self.assertIn("R = np.diag([0.02, 0.15])", source)
+        self.assertIn("np.zeros((ref_traj.shape[0], 1))", source)
+        self.assertNotIn("reference_poses_from_xy", source)
 
     def test_client_uses_pose_only_for_kinematic_mpc(self):
         client_path = (
@@ -1921,32 +1338,23 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_client_routes_model_candidate_through_trajectory_manager(self):
+    def test_client_installs_complete_reprojected_diffusion_in_upstream_mpc(self):
         source = self.client_source()
 
-        self.assertIn("TrajectoryManager(", source)
-        self.assertIn("candidate_eligible=critic_safe", source)
-        self.assertIn("active_traj = trajectory_update.active_traj", source)
-        self.assertIn(
-            "N=trajectory_update.diffusion_point_count",
-            source,
-        )
-        self.assertIn(
-            "blind_steps=trajectory_update.blind_point_count",
-            source,
-        )
-        self.assertNotIn("self.mpc.update_ref_traj(world_xy)", source)
-
-    def test_client_rebuilds_mpc_only_for_changed_total_horizon(self):
-        source = self.client_source()
-
-        self.assertIn(
-            "self.mpc.prediction_steps\n"
-            "                            != trajectory_update.mpc_prediction_steps",
-            source,
-        )
+        self.assertIn("active_traj = normalize_tracking_trajectory(", source)
         self.assertIn("self.mpc = Mpc_controller(", source)
-        self.assertIn("self.mpc.update_ref_traj(", source)
+        self.assertIn("desired_v=self.args.max_v", source)
+        self.assertNotIn("TrajectoryManager", source)
+        self.assertNotIn("trajectory_update", source)
+        self.assertNotIn("blind_steps=", source)
+        self.assertNotIn("N=trajectory_update", source)
+
+    def test_client_rebuilds_upstream_mpc_for_every_valid_plan(self):
+        source = self.client_source()
+
+        self.assertIn("self.mpc = Mpc_controller(", source)
+        self.assertNotIn("self.mpc.update_ref_traj(", source)
+        self.assertNotIn("prediction_steps", source)
 
     def test_client_gates_control_on_active_trajectory(self):
         source = self.client_source()
@@ -1961,7 +1369,7 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("failed to install active trajectory", source)
         self.assertIn('reason = "active_trajectory_error"', source)
 
-    def test_client_exposes_trajectory_manager_defaults(self):
+    def test_client_does_not_expose_trajectory_manager_options(self):
         source = self.client_source()
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -1977,58 +1385,27 @@ class RosClientSourceTests(unittest.TestCase):
             text=True,
         )
 
-        for required in (
-            '--trajectory-point-spacing", type=float, default=0.05',
-            '--trajectory-join-distance", type=float, default=0.50',
-            '--trajectory-join-heading-deg", type=float, default=60.0',
-            '--trajectory-min-remaining", type=float, default=0.20',
-        ):
-            self.assertIn(required, source)
-
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertNotIn("--trajectory-history-distance", help_result.stdout)
-        self.assertNotIn("--trajectory-commit-horizon", help_result.stdout)
-        self.assertNotIn("--trajectory-overlap-length", help_result.stdout)
-        self.assertNotIn("--trajectory-overlap-distance", help_result.stdout)
-        self.assertNotIn("trajectory_history_distance", source)
-        self.assertNotIn("history_distance=", source)
+        self.assertNotIn("--trajectory-", help_result.stdout)
+        self.assertNotIn("trajectory_point_spacing", source)
+        self.assertNotIn("trajectory_join_distance", source)
+        self.assertNotIn("trajectory_join_heading_deg", source)
+        self.assertNotIn("trajectory_min_remaining", source)
 
-    def test_client_records_candidate_decision_and_active_trajectory(self):
+    def test_client_records_direct_reprojected_active_trajectory(self):
         source = self.client_source()
 
         for required in (
             '"reprojected_world_xy": retained_reprojected_world_xy',
             '"active_traj": active_traj',
-            '"candidate_accepted": trajectory_update.candidate_accepted',
-            '"trajectory_reason": trajectory_update.reason',
-            '"trajectory_join_distance_m"',
-            "trajectory_update.join_distance_m",
-            '"trajectory_remaining_length_m"',
-            "trajectory_update.remaining_length_m",
-            '"trajectory_blind_length_m"',
-            "trajectory_update.blind_length_m",
-            '"trajectory_blind_point_count"',
-            "trajectory_update.blind_point_count",
-            '"trajectory_diffusion_length_m"',
-            "trajectory_update.diffusion_length_m",
-            '"trajectory_diffusion_point_count"',
-            "trajectory_update.diffusion_point_count",
-            '"trajectory_diffusion_spacing_m"',
-            "trajectory_update.diffusion_spacing_m",
-            '"trajectory_projection_advance_m"',
-            "trajectory_update.projection_advance_m",
-            '"trajectory_blind_max_turn_deg"',
-            "trajectory_update.blind_max_turn_degrees",
-            '"mpc_prediction_steps"',
-            "trajectory_update.mpc_prediction_steps",
-            '"trajectory_manager_update_ms"',
-            "trajectory_update.manager_update_ms",
+            '"mpc_horizon": self.mpc.N',
         ):
             self.assertIn(required, source)
-        self.assertNotIn('"trajectory_history_length_m"', source)
-        self.assertNotIn('"trajectory_far_length_m"', source)
-        self.assertNotIn('"trajectory_preserved_length_m"', source)
-        self.assertNotIn('"trajectory_overlap_error_m"', source)
+        self.assertNotIn('"candidate_accepted"', source)
+        self.assertNotIn('"trajectory_reason"', source)
+        self.assertNotIn('"trajectory_blind_', source)
+        self.assertNotIn('"trajectory_diffusion_', source)
+        self.assertNotIn('"trajectory_manager_update_ms"', source)
 
     def test_bev_uses_rgbd_snapshot_odom_as_the_render_pose(self):
         source = self.client_source()
