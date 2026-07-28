@@ -1265,6 +1265,56 @@ class RosClientSourceTests(unittest.TestCase):
             source,
         )
 
+    def test_client_exposes_virtual_camera_height_default(self):
+        source = self.client_source()
+        client_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "realworld"
+            / "navdp_imagegoal_client.py"
+        )
+        help_result = subprocess.run(
+            [sys.executable, str(client_path), "--help"],
+            cwd=client_path.parents[2],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertIn(
+            'parser.add_argument("--virtual-camera-height", type=float, default=0.2)',
+            source,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--virtual-camera-height", help_result.stdout)
+
+    def test_client_logs_raw_and_reprojected_plan_geometry(self):
+        source = self.client_source()
+
+        for required in (
+            '"raw_selected_world_xy": retained_raw_world_xy',
+            '"reprojected_base_xy": reprojected_base_xy',
+            '"reprojected_world_xy": retained_reprojected_world_xy',
+            '"virtual_camera_height_m": self.args.virtual_camera_height',
+            '"reprojection_status":',
+            '"reprojection_reason": reprojection_error',
+        ):
+            self.assertIn(required, source)
+
+    def test_client_distinguishes_unattempted_reprojection_and_throttles_rejections(self):
+        source = self.client_source()
+
+        for required in (
+            'reprojection_status = "not_attempted"',
+            'reprojection_status = "ok"',
+            'reprojection_status = "rejected"',
+            '"reprojection_status": reprojection_status',
+            "self.last_reprojection_error_log = 0.0",
+            "reprojection_log_time - self.last_reprojection_error_log >= 2.0",
+            "self.last_reprojection_error_log = reprojection_log_time",
+        ):
+            self.assertIn(required, source)
+
     def test_client_has_real_robot_inputs_and_explicit_control_gate(self):
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -1603,6 +1653,10 @@ class RosClientSourceTests(unittest.TestCase):
             "`static_transform_publisher`",
             "/home/dev/navdp_deployment/navdp_runtime/navdp-imagegoal-client",
             "--goal-image goal_far.jpg",
+            "--virtual-camera-height 0.2",
+            "虚拟相机高度",
+            "黄色",
+            "青色",
         ):
             self.assertIn(required, source)
         for removed in (
@@ -1754,7 +1808,7 @@ class RosClientSourceTests(unittest.TestCase):
         source = self.client_source()
 
         for required in (
-            '"candidate_world_xy": retained_world_xy',
+            '"reprojected_world_xy": retained_reprojected_world_xy',
             '"active_traj": active_traj',
             '"candidate_accepted": trajectory_update.candidate_accepted',
             '"trajectory_reason": trajectory_update.reason',

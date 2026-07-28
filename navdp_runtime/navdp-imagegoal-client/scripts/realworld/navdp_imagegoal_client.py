@@ -115,6 +115,13 @@ class MpcVisualizationSnapshot:
 class NavdpImageGoalClient(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__("navdp_imagegoal_client")
+        if (
+            not np.isfinite(args.virtual_camera_height)
+            or args.virtual_camera_height <= 0.0
+        ):
+            raise ValueError(
+                "--virtual-camera-height must be positive and finite"
+            )
         goal_bgr = cv2.imread(args.goal_image, cv2.IMREAD_COLOR)
         if goal_bgr is None:
             raise FileNotFoundError(f"cannot read goal image: {args.goal_image}")
@@ -186,6 +193,7 @@ class NavdpImageGoalClient(Node):
         self.last_control_log = 0.0
         self.last_control_reason = None
         self.last_tf_error_log = 0.0
+        self.last_reprojection_error_log = 0.0
         self.latest_mpc_visualization = None
         self.visualization_state = None
         self.visualization_queue = queue.Queue(maxsize=1)
@@ -531,6 +539,7 @@ class NavdpImageGoalClient(Node):
             reprojected_world_xy = None
             retained_reprojected_world_xy = None
             reprojection_error = None
+            reprojection_status = "not_attempted"
             trajectory_prefix = np.empty((0, 2), dtype=np.float64)
             candidate_world_xy = np.empty((0, 0, 2), dtype=np.float64)
             candidate_values = np.empty(0, dtype=np.float64)
@@ -646,8 +655,10 @@ class NavdpImageGoalClient(Node):
                             reprojected_world_xy[:prefix_end],
                         )
                     )
+                    reprojection_status = "ok"
                 except ValueError as error:
                     reprojection_error = str(error)
+                    reprojection_status = "rejected"
                     retained_reprojected_world_xy = None
                 candidate_world_xy = np.asarray(
                     [
@@ -686,15 +697,20 @@ class NavdpImageGoalClient(Node):
                 )
                 self._queue_visualization(snapshot)
                 if reprojection_error is not None:
-                    self.get_logger().warning(
-                        "NavDP virtual reprojection rejected: %s active=%s"
-                        % (
-                            reprojection_error,
-                            "retained"
-                            if active_traj is not None
-                            else "unavailable",
+                    reprojection_log_time = time.monotonic()
+                    if (
+                        reprojection_log_time - self.last_reprojection_error_log >= 2.0
+                    ):
+                        self.get_logger().warning(
+                            "NavDP virtual reprojection rejected: %s active=%s"
+                            % (
+                                reprojection_error,
+                                "retained"
+                                if active_traj is not None
+                                else "unavailable",
+                            )
                         )
-                    )
+                        self.last_reprojection_error_log = reprojection_log_time
                 if not critic_safe:
                     self.get_logger().warning(
                         "NavDP candidate below critic threshold: "
@@ -728,6 +744,28 @@ class NavdpImageGoalClient(Node):
                         "trajectory unavailable: reason=%s"
                         % trajectory_update.reason
                     )
+                self._write_diagnostic(
+                    {
+                        "type": "plan",
+                        "wall_time": time.time(),
+                        "monotonic_time": time.monotonic(),
+                        "frame_sequence": snapshot.sequence,
+                        "critic": critic_max,
+                        "snapshot_odom": snapshot.odom_xy_yaw,
+                        "camera_pose": snapshot.camera_xy_yaw,
+                        "selected_local_xy": local_xy,
+                        "raw_selected_world_xy": retained_raw_world_xy,
+                        "reprojected_base_xy": reprojected_base_xy,
+                        "reprojected_world_xy": retained_reprojected_world_xy,
+                        "virtual_camera_height_m": self.args.virtual_camera_height,
+                        "reprojection_status": reprojection_status,
+                        "reprojection_reason": reprojection_error,
+                        "active_traj": None,
+                        "planning_error": (
+                            None if planning_error is None else str(planning_error)
+                        ),
+                    }
+                )
             else:
                 try:
                     with self.mpc_lock:
@@ -803,8 +841,12 @@ class NavdpImageGoalClient(Node):
                         "snapshot_odom": snapshot.odom_xy_yaw,
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
-                        "navdp_world_xy": retained_raw_world_xy,
-                        "candidate_world_xy": retained_reprojected_world_xy,
+                        "raw_selected_world_xy": retained_raw_world_xy,
+                        "reprojected_base_xy": reprojected_base_xy,
+                        "reprojected_world_xy": retained_reprojected_world_xy,
+                        "virtual_camera_height_m": self.args.virtual_camera_height,
+                        "reprojection_status": reprojection_status,
+                        "reprojection_reason": reprojection_error,
                         "active_traj": active_traj,
                         "candidate_accepted": trajectory_update.candidate_accepted,
                         "trajectory_reason": trajectory_update.reason,
@@ -1332,6 +1374,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-v", type=float, default=0.1)
     parser.add_argument("--max-w", type=float, default=0.50)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
+    parser.add_argument("--virtual-camera-height", type=float, default=0.2)
     parser.add_argument("--trajectory-point-spacing", type=float, default=0.05)
     parser.add_argument("--trajectory-join-distance", type=float, default=0.50)
     parser.add_argument("--trajectory-join-heading-deg", type=float, default=60.0)

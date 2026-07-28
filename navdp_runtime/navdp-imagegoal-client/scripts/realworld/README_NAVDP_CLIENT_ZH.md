@@ -70,6 +70,19 @@ D435 当前视角下，模型给出的最近引导点可能仍离底盘较远。
 输出和 MPC 之间增加 `TrajectoryManager`，在 `odom` 坐标系保存已经接纳的
 历史引导点。模型每次输出只作为远端候选，不再直接替换 MPC 轨迹。
 
+NavDP 原始 selected diffusion 先按官方虚拟相机高度 `0.2 m` 投影到像素，
+再通过当前 D435 optical TF 与 `base_link` 地面 `z=0` 求交。求交后的黄色
+`active_traj` 是 MPC 控制参考；青色轨迹保留未经重投影的原始 selected
+diffusion，仅用于对比。虚拟相机高度可显式配置：
+
+```text
+--virtual-camera-height 0.2
+```
+
+如果射线与地面平行、交点位于相机后方、交点不在底盘前方或轨迹前向次序
+非法，本轮新候选会被拒绝：已有黄色 active guide 继续执行；尚无有效 guide
+时保持停车。
+
 每轮规划会先删除已经走过的历史点，再用当前底盘位置重新锚定轨迹。因此：
 
 - `active_traj` 的第一个引导点就是当前底盘位置，距离严格为 `0 m`；
@@ -217,10 +230,12 @@ MPC BEV 视频的图层从下到上包括绿色 `actual` 实走里程计、红�
 轨迹、青色 `selected` 原始 selected diffusion、黄色 `guide` 离散引导点，
 以及最后绘制的白色底盘矩形和方向箭头。青线只在候选被
 `TrajectoryManager` 接纳并成功安装进 MPC 后更新；候选被拒绝时继续显示与
-当前 MPC 参考对应的上一次 selected diffusion。黄色点是
+当前 MPC 参考对应的上一次 selected diffusion。青色轨迹使用 NavDP 原始
+平面坐标；黄色点使用虚拟相机像素经真实 D435 透视与地面求交后的控制坐标。
+黄色点是
 `TrajectoryManager.active_traj` 在送入 MPC 稠密化前的离散路径，不是 MPC
 控制器内部的稠密 `ref_traj`；第一个较大点表示底盘锚点。青黄两层的分离直接
-表示原始 selected diffusion 经轨迹管理后发生的变化。
+表示原始 selected diffusion 经透视重投影和轨迹管理后发生的变化。
 
 只有 MPC 快照新鲜且里程计为 `ODOM OK` 时才显示红色 MPC 预测、青色 selected
 和黄色 guide；里程计过期时三者都会隐藏，避免在过期坐标系中显示路径。这些
@@ -258,9 +273,10 @@ PYTHONPATH=.. python3 -m unittest \
 /home/dev/NavDP-official-bebb436/navdp_logs/YYYYMMDD_HHMMSS_mpc.jsonl
 ```
 
-`plan` 行记录模型候选、实际 `active_traj`、候选接纳结果、拼接距离、剩余
-轨迹长度、保留历史长度 `trajectory_preserved_length_m`、重叠误差
-`trajectory_overlap_error_m`、规划时的 odom/相机位姿、critic 和规划耗时；
+`plan` 行记录 `selected_local_xy`、原始 `raw_selected_world_xy`、重投影后的
+`reprojected_base_xy` / `reprojected_world_xy`、虚拟相机高度、重投影状态与
+拒绝原因，并同时记录实际 `active_traj`、候选接纳结果、拼接距离、剩余轨迹
+长度、规划时的 odom/相机位姿、critic 和规划耗时；
 `control` 行按控制周期记录 odom 位姿与实测速度、发送的 `v/w`、MPC 参考状态、
 预测状态、求解耗时及 frame/odom/plan 数据年龄。其中
 `desired_velocity=[linear_x, angular_z]` 是期望/发布速度，
