@@ -176,6 +176,42 @@ class TrajectoryManagerTests(unittest.TestCase):
         np.testing.assert_array_equal(result.active_traj[-3:], candidate)
         np.testing.assert_array_equal(result.active_traj[0], [0.0, 0.0])
 
+    def test_initial_candidate_at_chassis_has_zero_blind_guides(self):
+        manager = self.make_manager()
+        candidate = np.array([[0.0, 0.0], [1.0, 0.0]])
+
+        result = manager.update(
+            [0.0, 0.0],
+            candidate,
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        self.assertEqual(result.blind_point_count, 0)
+        self.assertEqual(result.blind_length_m, 0.0)
+        self.assertEqual(result.diffusion_point_count, 2)
+        np.testing.assert_array_equal(result.active_traj[-2:], candidate)
+
+    def test_replacement_candidate_at_chassis_has_zero_blind_guides(self):
+        manager = self.make_manager()
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.5, 0.0], [1.0, 0.0]]),
+            candidate_eligible=True,
+        )
+        candidate = np.array([[0.0, 0.0], [1.0, 0.0]])
+
+        result = manager.update(
+            [0.0, 0.0],
+            candidate,
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        self.assertEqual(result.blind_point_count, 0)
+        self.assertEqual(result.blind_length_m, 0.0)
+        np.testing.assert_array_equal(result.active_traj[-2:], candidate)
+
     def test_candidate_does_not_need_continuous_overlap(self):
         manager = self.make_manager()
         manager.update(
@@ -366,6 +402,31 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertEqual(
             result.diffusion_point_count,
             initialized.diffusion_point_count,
+        )
+
+    def test_tiny_candidate_does_not_replace_healthy_history(self):
+        manager = self.make_manager(min_remaining=0.20)
+        previous = manager.update(
+            [0.0, 0.0],
+            np.array([[0.5, 0.0], [1.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[0.01, 0.0], [0.011, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "candidate_too_short")
+        np.testing.assert_array_equal(
+            result.active_traj,
+            previous.active_traj,
+        )
+        self.assertEqual(
+            result.mpc_prediction_steps,
+            previous.mpc_prediction_steps,
         )
 
     def test_result_does_not_allow_mutating_manager_state(self):

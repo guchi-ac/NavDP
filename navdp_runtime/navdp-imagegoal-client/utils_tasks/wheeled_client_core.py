@@ -86,14 +86,14 @@ class TrajectoryManager:
 
         if candidate is not None:
             if history is None:
-                blind_path = self._densify_preserving_vertices(
-                    self._normalize_polyline(
-                        np.vstack((chassis, candidate[0]))
-                    )
+                blind_path = self._build_blind_path(
+                    np.vstack((chassis, candidate[0]))
                 )
                 blind_guides = blind_path[1:-1]
-                initialized = np.vstack(
-                    (chassis, blind_guides, candidate)
+                initialized = self._assemble_active_trajectory(
+                    chassis,
+                    blind_guides,
+                    candidate,
                 )
                 if self._polyline_length(initialized) >= self.min_remaining:
                     active = initialized
@@ -162,20 +162,29 @@ class TrajectoryManager:
                             atol=np.finfo(np.float64).eps,
                         ):
                             prefix_points.append(candidate[0])
-                        blind_path = self._densify_preserving_vertices(
+                        blind_path = self._build_blind_path(
                             np.asarray(prefix_points)
                         )
                         blind_guides = blind_path[1:-1]
-                        active = np.vstack(
-                            (chassis, blind_guides, candidate)
-                        )
-                        accepted = True
-                        reason = "candidate_replaced"
-                        self._set_candidate_metadata(
-                            blind_path,
+                        proposed = self._assemble_active_trajectory(
+                            chassis,
                             blind_guides,
                             candidate,
                         )
+                        if (
+                            self._polyline_length(proposed)
+                            < self.min_remaining
+                        ):
+                            reason = "candidate_too_short"
+                        else:
+                            active = proposed
+                            accepted = True
+                            reason = "candidate_replaced"
+                            self._set_candidate_metadata(
+                                blind_path,
+                                blind_guides,
+                                candidate,
+                            )
 
         if active is None and had_history and candidate_world_xy is None:
             reason = "history_exhausted"
@@ -240,22 +249,6 @@ class TrajectoryManager:
             ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
         )
 
-    def _resample_polyline(self, points: np.ndarray) -> np.ndarray:
-        segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-        cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-        total = float(cumulative[-1])
-        targets = np.arange(0.0, total, self.point_spacing)
-        if len(targets) == 0 or not np.isclose(targets[-1], total):
-            targets = np.append(targets, total)
-        else:
-            targets[-1] = total
-        return np.column_stack(
-            (
-                np.interp(targets, cumulative, points[:, 0]),
-                np.interp(targets, cumulative, points[:, 1]),
-            )
-        )
-
     def _densify_preserving_vertices(self, points: np.ndarray) -> np.ndarray:
         points = self._normalize_polyline(points)
         dense = [points[0]]
@@ -270,6 +263,33 @@ class TrajectoryManager:
                 dense.append(start + segment * (distance / length))
             dense.append(end)
         return self._normalize_polyline(np.asarray(dense))
+
+    def _build_blind_path(self, points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float64)
+        keep = np.concatenate(
+            (
+                np.array([True]),
+                np.linalg.norm(np.diff(points, axis=0), axis=1)
+                > np.finfo(np.float64).eps,
+            )
+        )
+        distinct = points[keep]
+        if len(distinct) == 1:
+            return distinct
+        return self._densify_preserving_vertices(distinct)
+
+    @staticmethod
+    def _assemble_active_trajectory(
+        chassis: np.ndarray,
+        blind_guides: np.ndarray,
+        candidate: np.ndarray,
+    ) -> np.ndarray:
+        if (
+            len(blind_guides) == 0
+            and np.array_equal(chassis, candidate[0])
+        ):
+            return candidate.copy()
+        return np.vstack((chassis, blind_guides, candidate))
 
     def _set_candidate_metadata(
         self,
@@ -287,47 +307,6 @@ class TrajectoryManager:
         self._blind_point_count = 0
         self._diffusion_length_m = 0.0
         self._diffusion_point_count = 0
-
-    @staticmethod
-    def _point_at_arc(
-        points: np.ndarray,
-        cumulative: np.ndarray,
-        target: float,
-    ):
-        index = min(
-            int(np.searchsorted(cumulative, target, side="right") - 1),
-            len(points) - 2,
-        )
-        segment_length = float(cumulative[index + 1] - cumulative[index])
-        fraction = float((target - cumulative[index]) / segment_length)
-        point = points[index] + fraction * (points[index + 1] - points[index])
-        return index, point
-
-    @classmethod
-    def _prefix_through_arc(
-        cls,
-        points: np.ndarray,
-        end_arc: float,
-    ) -> np.ndarray:
-        cumulative = cls._cumulative_lengths(points)
-        if end_arc >= cumulative[-1] - 1e-9:
-            return points.copy()
-        index, boundary = cls._point_at_arc(points, cumulative, end_arc)
-        return cls._normalize_polyline(
-            np.vstack((points[: index + 1], boundary))
-        )
-
-    @classmethod
-    def _suffix_from_arc(
-        cls,
-        points: np.ndarray,
-        start_arc: float,
-    ) -> np.ndarray:
-        cumulative = cls._cumulative_lengths(points)
-        index, boundary = cls._point_at_arc(points, cumulative, start_arc)
-        return cls._normalize_polyline(
-            np.vstack((boundary, points[index + 1 :]))
-        )
 
     @staticmethod
     def _projection_with_arc(
