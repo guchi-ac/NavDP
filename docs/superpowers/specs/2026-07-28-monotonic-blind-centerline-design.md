@@ -123,10 +123,11 @@ geometry cannot accumulate perpendicular correction segments.
 After advancing history:
 
 1. Normalize the current candidate without resampling it.
-2. Examine centerline segments in increasing arc order and select the earliest
-   candidate-first-point projection that passes the existing join-distance
-   gate. This prevents a crossing path from selecting a later branch merely
-   because it is marginally closer in Euclidean distance.
+2. Project `candidate[0]` onto every forward centerline segment and select the
+   minimum-distance projection. If projections are equal within numerical
+   tolerance, select the one with the smallest arc coordinate. This preserves
+   the geometrically correct join on ordinary paths while making exact
+   self-crossing ties deterministic and forward-order preserving.
 3. Reject a join whose projected arc is behind current progress or whose
    distance/heading gates fail. An equal-arc zero-blind join remains valid.
 4. Construct the proposed persistent centerline as:
