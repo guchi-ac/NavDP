@@ -317,6 +317,59 @@ class TrajectoryManagerTests(unittest.TestCase):
             [[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]],
         )
 
+    def test_blind_guides_use_current_diffusion_median_spacing(self):
+        manager = self.make_manager(point_spacing=0.05)
+        candidate = np.array(
+            [[0.60, 0.0], [0.75, 0.0], [0.90, 0.0], [1.05, 0.0]]
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            candidate,
+            candidate_eligible=True,
+        )
+
+        np.testing.assert_allclose(
+            result.active_traj[1:4],
+            [[0.15, 0.0], [0.30, 0.0], [0.45, 0.0]],
+            atol=1e-9,
+        )
+        self.assertEqual(result.blind_point_count, 3)
+        np.testing.assert_array_equal(result.active_traj[-4:], candidate)
+
+    def test_lateral_reanchoring_never_accumulates_projection_corners(self):
+        manager = self.make_manager(point_spacing=0.05)
+        candidate = np.array(
+            [[0.60, 0.0], [0.75, 0.0], [0.90, 0.0], [1.05, 0.0]]
+        )
+        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
+
+        for index in range(100):
+            result = manager.update([0.0, 0.01 if index % 2 else -0.01])
+
+        self.assertLessEqual(result.blind_point_count, 3)
+        self.assertLessEqual(len(result.active_traj), 1 + 3 + len(candidate))
+        blind_with_seams = np.vstack(
+            (
+                result.active_traj[: 1 + result.blind_point_count],
+                result.active_traj[-len(candidate)],
+            )
+        )
+        headings = np.arctan2(
+            np.diff(blind_with_seams[:, 1]),
+            np.diff(blind_with_seams[:, 0]),
+        )
+        turns = np.abs(
+            np.arctan2(
+                np.sin(np.diff(headings)),
+                np.cos(np.diff(headings)),
+            )
+        )
+        self.assertLess(
+            float(np.max(turns, initial=0.0)),
+            math.radians(15.0),
+        )
+
     def test_blind_history_is_not_capped_at_one_meter(self):
         manager = self.make_manager(point_spacing=0.10)
         manager.update(
@@ -356,7 +409,7 @@ class TrajectoryManagerTests(unittest.TestCase):
             expected,
         )
 
-    def test_initial_candidate_densifies_only_chassis_blind_connector(self):
+    def test_initial_candidate_samples_blind_connector_at_diffusion_spacing(self):
         manager = self.make_manager(point_spacing=0.25)
         candidate = np.array([[1.0, 0.0], [1.37, 0.23], [2.0, 0.7]])
 
@@ -366,9 +419,17 @@ class TrajectoryManagerTests(unittest.TestCase):
         )
 
         self.assertEqual(result.reason, "initialized")
-        self.assertEqual(result.blind_point_count, 3)
+        expected_spacing = 0.5 * (
+            math.hypot(0.37, 0.23) + math.hypot(0.63, 0.47)
+        )
+        self.assertEqual(result.blind_point_count, 1)
         self.assertEqual(result.diffusion_point_count, 3)
-        self.assertEqual(result.mpc_prediction_steps, 6)
+        self.assertEqual(result.mpc_prediction_steps, 4)
+        np.testing.assert_allclose(
+            result.active_traj[1],
+            [expected_spacing, 0.0],
+            atol=1e-9,
+        )
         np.testing.assert_array_equal(result.active_traj[-3:], candidate)
         np.testing.assert_array_equal(result.active_traj[0], [0.0, 0.0])
 
@@ -660,10 +721,10 @@ class TrajectoryManagerTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(result.blind_length_m, 1.0)
-        self.assertEqual(result.blind_point_count, 4)
+        self.assertEqual(result.blind_point_count, 0)
         self.assertAlmostEqual(result.diffusion_length_m, 2.0)
         self.assertEqual(result.diffusion_point_count, 2)
-        self.assertEqual(result.mpc_prediction_steps, 6)
+        self.assertEqual(result.mpc_prediction_steps, 2)
         self.assertAlmostEqual(result.remaining_length_m, 3.0)
         self.assertGreaterEqual(result.manager_update_ms, 0.0)
 

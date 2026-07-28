@@ -83,6 +83,11 @@ class TrajectoryManager:
         self.join_distance = float(join_distance)
         self.join_heading = math.radians(float(join_heading_degrees))
         self.min_remaining = float(min_remaining)
+        self._history_centerline = None
+        self._diffusion_tail = None
+        self._diffusion_start_arc = 0.0
+        self._diffusion_spacing = self.point_spacing
+        self._last_chassis = None
         self._active_traj = None
         self._blind_length_m = 0.0
         self._blind_point_count = 0
@@ -100,8 +105,9 @@ class TrajectoryManager:
         if chassis.shape != (2,) or not np.isfinite(chassis).all():
             raise ValueError("chassis_xy must be a finite shape-(2,) point")
 
-        history, had_history = self._advance_history(chassis)
-        active = history
+        had_history = self._history_centerline is not None
+        history = self._advance_centerline(chassis)
+        active = self._build_active_trajectory(chassis)
         accepted = False
         join_distance_m = None
         reason = "history_retained" if history is not None else "no_history"
@@ -118,21 +124,38 @@ class TrajectoryManager:
 
         if candidate is not None:
             if history is None:
-                blind_path = self._build_blind_path(
-                    np.vstack((chassis, candidate[0]))
-                )
-                blind_guides = blind_path[1:-1]
-                initialized = self._assemble_active_trajectory(
-                    chassis,
-                    blind_guides,
+                spacing = self._candidate_spacing(
                     candidate,
+                    self.point_spacing,
                 )
-                if self._polyline_length(initialized) >= self.min_remaining:
-                    active = initialized
+                connector_length = float(
+                    np.linalg.norm(candidate[0] - chassis)
+                )
+                proposed_centerline = self._normalize_polyline(
+                    np.vstack((chassis, candidate))
+                )
+                proposed_active, blind_guides = self._active_from_state(
+                    chassis,
+                    proposed_centerline,
+                    candidate,
+                    connector_length,
+                    spacing,
+                )
+                if (
+                    self._polyline_length(proposed_active)
+                    >= self.min_remaining
+                ):
+                    self._install_candidate_state(
+                        proposed_centerline,
+                        candidate,
+                        connector_length,
+                        spacing,
+                    )
+                    active = proposed_active
                     accepted = True
                     reason = "initialized"
                     self._set_candidate_metadata(
-                        blind_path,
+                        chassis,
                         blind_guides,
                         candidate,
                     )
@@ -144,7 +167,7 @@ class TrajectoryManager:
                     join_distance_m,
                     segment_index,
                     join_point,
-                    _,
+                    join_arc,
                 ) = self._projection_with_arc(
                     history,
                     history_cumulative,
@@ -179,29 +202,31 @@ class TrajectoryManager:
                     if max(heading_deltas) > self.join_heading:
                         reason = "join_heading"
                     else:
-                        prefix_points = list(history[: segment_index + 1])
-                        if not np.allclose(
-                            prefix_points[-1],
-                            join_point,
-                            rtol=0.0,
-                            atol=np.finfo(np.float64).eps,
-                        ):
-                            prefix_points.append(join_point)
-                        if not np.allclose(
-                            prefix_points[-1],
-                            candidate[0],
-                            rtol=0.0,
-                            atol=np.finfo(np.float64).eps,
-                        ):
-                            prefix_points.append(candidate[0])
-                        blind_path = self._build_blind_path(
-                            np.asarray(prefix_points)
+                        history_prefix = self._prefix_through_arc(
+                            history,
+                            join_arc,
                         )
-                        blind_guides = blind_path[1:-1]
-                        proposed = self._assemble_active_trajectory(
-                            chassis,
-                            blind_guides,
+                        proposed_centerline = self._normalize_polyline(
+                            np.vstack((history_prefix, candidate))
+                        )
+                        proposed_start_arc = (
+                            self._polyline_length(history_prefix)
+                            + float(
+                                np.linalg.norm(
+                                    candidate[0] - history_prefix[-1]
+                                )
+                            )
+                        )
+                        proposed_spacing = self._candidate_spacing(
                             candidate,
+                            self.point_spacing,
+                        )
+                        proposed, blind_guides = self._active_from_state(
+                            chassis,
+                            proposed_centerline,
+                            candidate,
+                            proposed_start_arc,
+                            proposed_spacing,
                         )
                         if (
                             self._polyline_length(proposed)
@@ -212,8 +237,14 @@ class TrajectoryManager:
                             active = proposed
                             accepted = True
                             reason = "candidate_replaced"
+                            self._install_candidate_state(
+                                proposed_centerline,
+                                candidate,
+                                proposed_start_arc,
+                                proposed_spacing,
+                            )
                             self._set_candidate_metadata(
-                                blind_path,
+                                chassis,
                                 blind_guides,
                                 candidate,
                             )
@@ -222,7 +253,9 @@ class TrajectoryManager:
             reason = "history_exhausted"
         self._active_traj = None if active is None else active.copy()
         if self._active_traj is None:
-            self._clear_candidate_metadata()
+            self._clear_persistent_state()
+        elif self._history_centerline is not None:
+            self._last_chassis = chassis.copy()
         remaining = (
             0.0
             if self._active_traj is None
@@ -281,34 +314,65 @@ class TrajectoryManager:
             ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
         )
 
-    def _densify_preserving_vertices(self, points: np.ndarray) -> np.ndarray:
-        points = self._normalize_polyline(points)
-        dense = [points[0]]
-        for start, end in zip(points[:-1], points[1:]):
-            segment = end - start
-            length = float(np.linalg.norm(segment))
-            for distance in np.arange(
-                self.point_spacing,
-                length,
-                self.point_spacing,
-            ):
-                dense.append(start + segment * (distance / length))
-            dense.append(end)
-        return self._normalize_polyline(np.asarray(dense))
+    @staticmethod
+    def _candidate_spacing(candidate: np.ndarray, minimum: float) -> float:
+        lengths = np.linalg.norm(np.diff(candidate, axis=0), axis=1)
+        return max(float(np.median(lengths)), minimum)
 
-    def _build_blind_path(self, points: np.ndarray) -> np.ndarray:
-        points = np.asarray(points, dtype=np.float64)
+    @classmethod
+    def _point_at_arc(cls, points: np.ndarray, target_arc: float):
+        cumulative = cls._cumulative_lengths(points)
+        target = float(np.clip(target_arc, 0.0, cumulative[-1]))
+        index = min(
+            int(np.searchsorted(cumulative, target, side="right") - 1),
+            len(points) - 2,
+        )
+        segment_length = cumulative[index + 1] - cumulative[index]
+        fraction = (target - cumulative[index]) / segment_length
+        return index, points[index] + fraction * (
+            points[index + 1] - points[index]
+        )
+
+    @classmethod
+    def _trim_from_arc(cls, points: np.ndarray, start_arc: float) -> np.ndarray:
+        index, boundary = cls._point_at_arc(points, start_arc)
+        remainder = np.vstack((boundary, points[index + 1 :]))
+        return cls._normalize_polyline(remainder)
+
+    @classmethod
+    def _prefix_through_arc(
+        cls,
+        points: np.ndarray,
+        end_arc: float,
+    ) -> np.ndarray:
+        if end_arc <= np.finfo(np.float64).eps:
+            return points[:1].copy()
+        index, boundary = cls._point_at_arc(points, end_arc)
+        prefix = np.vstack((points[: index + 1], boundary))
         keep = np.concatenate(
             (
                 np.array([True]),
-                np.linalg.norm(np.diff(points, axis=0), axis=1)
+                np.linalg.norm(np.diff(prefix, axis=0), axis=1)
                 > np.finfo(np.float64).eps,
             )
         )
-        distinct = points[keep]
-        if len(distinct) == 1:
-            return distinct
-        return self._densify_preserving_vertices(distinct)
+        return prefix[keep]
+
+    @classmethod
+    def _sample_at_arcs(
+        cls,
+        points: np.ndarray,
+        arcs: np.ndarray,
+    ) -> np.ndarray:
+        if len(arcs) == 0:
+            return np.empty((0, 2), dtype=np.float64)
+        return np.asarray(
+            [
+                cls._point_at_arc(points, float(target_arc))[1]
+                for target_arc in arcs
+            ],
+            dtype=np.float64,
+        )
 
     @staticmethod
     def _assemble_active_trajectory(
@@ -323,18 +387,77 @@ class TrajectoryManager:
             return candidate.copy()
         return np.vstack((chassis, blind_guides, candidate))
 
+    def _active_from_state(
+        self,
+        chassis: np.ndarray,
+        centerline: np.ndarray,
+        candidate: np.ndarray,
+        diffusion_start_arc: float,
+        diffusion_spacing: float,
+    ):
+        blind_arcs = np.arange(
+            diffusion_spacing,
+            diffusion_start_arc,
+            diffusion_spacing,
+        )
+        blind_guides = self._sample_at_arcs(centerline, blind_arcs)
+        active = self._assemble_active_trajectory(
+            chassis,
+            blind_guides,
+            candidate,
+        )
+        return active, blind_guides
+
+    def _build_active_trajectory(self, chassis: np.ndarray):
+        if (
+            self._history_centerline is None
+            or self._diffusion_tail is None
+        ):
+            return None
+        active, blind_guides = self._active_from_state(
+            chassis,
+            self._history_centerline,
+            self._diffusion_tail,
+            self._diffusion_start_arc,
+            self._diffusion_spacing,
+        )
+        self._set_candidate_metadata(
+            chassis,
+            blind_guides,
+            self._diffusion_tail,
+        )
+        return active
+
+    def _install_candidate_state(
+        self,
+        centerline: np.ndarray,
+        candidate: np.ndarray,
+        diffusion_start_arc: float,
+        diffusion_spacing: float,
+    ):
+        self._history_centerline = centerline.copy()
+        self._diffusion_tail = candidate.copy()
+        self._diffusion_start_arc = float(diffusion_start_arc)
+        self._diffusion_spacing = float(diffusion_spacing)
+
     def _set_candidate_metadata(
         self,
-        blind_path: np.ndarray,
+        chassis: np.ndarray,
         blind_guides: np.ndarray,
         candidate: np.ndarray,
     ):
+        blind_path = np.vstack((chassis, blind_guides, candidate[0]))
         self._blind_length_m = self._polyline_length(blind_path)
         self._blind_point_count = len(blind_guides)
         self._diffusion_length_m = self._polyline_length(candidate)
         self._diffusion_point_count = len(candidate)
 
-    def _clear_candidate_metadata(self):
+    def _clear_persistent_state(self):
+        self._history_centerline = None
+        self._diffusion_tail = None
+        self._diffusion_start_arc = 0.0
+        self._diffusion_spacing = self.point_spacing
+        self._last_chassis = None
         self._blind_length_m = 0.0
         self._blind_point_count = 0
         self._diffusion_length_m = 0.0
@@ -359,54 +482,37 @@ class TrajectoryManager:
             )
             projection = start + fraction * segment
             distance = float(np.linalg.norm(point - projection))
-            if distance < best[0]:
+            if distance < best[0] - 1e-9:
                 projection_arc = float(
                     cumulative[index] + fraction * segment_length
                 )
                 best = (distance, index, projection, projection_arc)
         return best
 
-    @classmethod
-    def _closest_projection(cls, polyline: np.ndarray, point: np.ndarray):
-        distance, index, projection, _ = cls._projection_with_arc(
-            polyline,
-            cls._cumulative_lengths(polyline),
-            point,
-        )
-        return distance, index, projection
-
-    def _advance_history(self, chassis: np.ndarray):
-        if self._active_traj is None:
-            return None, False
-        _, segment_index, projection = self._closest_projection(
-            self._active_traj,
+    def _advance_centerline(self, chassis: np.ndarray):
+        if self._history_centerline is None:
+            return None
+        _, _, _, projection_arc = self._projection_with_arc(
+            self._history_centerline,
+            self._cumulative_lengths(self._history_centerline),
             chassis,
         )
-        forward_length = float(
-            np.linalg.norm(
-                self._active_traj[segment_index + 1] - projection
-            )
+        forward_length = (
+            self._polyline_length(self._history_centerline)
+            - projection_arc
         )
-        if segment_index + 1 < len(self._active_traj) - 1:
-            forward_length += self._polyline_length(
-                self._active_traj[segment_index + 1 :]
-            )
         if forward_length < self.min_remaining:
-            return None, True
-        try:
-            remainder = self._normalize_polyline(
-                np.vstack(
-                    (
-                        chassis,
-                        projection,
-                        self._active_traj[segment_index + 1 :],
-                    )
-                )
-            )
-        except ValueError:
-            return None, True
-        remainder[0] = chassis
-        return remainder, True
+            self._clear_persistent_state()
+            return None
+        self._history_centerline = self._trim_from_arc(
+            self._history_centerline,
+            projection_arc,
+        )
+        self._diffusion_start_arc = max(
+            0.0,
+            self._diffusion_start_arc - projection_arc,
+        )
+        return self._history_centerline
 
     @staticmethod
     def _heading_delta(first: np.ndarray, second: np.ndarray) -> float:
