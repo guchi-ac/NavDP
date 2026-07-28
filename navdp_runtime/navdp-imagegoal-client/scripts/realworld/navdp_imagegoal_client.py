@@ -160,7 +160,6 @@ class NavdpImageGoalClient(Node):
             join_distance=args.trajectory_join_distance,
             join_heading_degrees=args.trajectory_join_heading_deg,
             min_remaining=args.trajectory_min_remaining,
-            history_distance=args.trajectory_history_distance,
         )
         self.data_lock = threading.Lock()
         self.mpc_lock = threading.Lock()
@@ -686,15 +685,25 @@ class NavdpImageGoalClient(Node):
             else:
                 try:
                     with self.mpc_lock:
-                        if self.mpc is None:
+                        if (
+                            self.mpc is None
+                            or self.mpc.prediction_steps
+                            != trajectory_update.mpc_prediction_steps
+                        ):
                             self.mpc = Mpc_controller(
                                 active_traj,
+                                N=trajectory_update.diffusion_point_count,
+                                blind_steps=trajectory_update.blind_point_count,
                                 desired_v=self.args.max_v,
                                 v_max=self.args.max_v,
                                 w_max=self.args.max_w,
                             )
                         else:
-                            self.mpc.update_ref_traj(active_traj)
+                            self.mpc.update_ref_traj(
+                                active_traj,
+                                N=trajectory_update.diffusion_point_count,
+                                blind_steps=trajectory_update.blind_point_count,
+                            )
                         self.installed_active_traj = np.asarray(active_traj).copy()
                         self.installed_active_traj.setflags(write=False)
                 except Exception as error:
@@ -750,14 +759,20 @@ class NavdpImageGoalClient(Node):
                         "trajectory_remaining_length_m": (
                             trajectory_update.remaining_length_m
                         ),
-                        "trajectory_history_length_m": (
-                            trajectory_update.history_length_m
+                        "trajectory_blind_length_m": (
+                            trajectory_update.blind_length_m
                         ),
-                        "trajectory_history_point_count": (
-                            trajectory_update.history_point_count
+                        "trajectory_blind_point_count": (
+                            trajectory_update.blind_point_count
                         ),
-                        "trajectory_far_length_m": (
-                            trajectory_update.far_length_m
+                        "trajectory_diffusion_length_m": (
+                            trajectory_update.diffusion_length_m
+                        ),
+                        "trajectory_diffusion_point_count": (
+                            trajectory_update.diffusion_point_count
+                        ),
+                        "mpc_prediction_steps": (
+                            trajectory_update.mpc_prediction_steps
                         ),
                         "trajectory_manager_update_ms": (
                             trajectory_update.manager_update_ms
@@ -769,16 +784,19 @@ class NavdpImageGoalClient(Node):
                 )
                 self.get_logger().info(
                     "active trajectory: reason=%s accepted=%s points=%d "
-                    "remaining=%.3f history=%.3f history_points=%d "
-                    "far=%.3f join=%s manager_ms=%.3f"
+                    "remaining=%.3f blind=%.3f blind_points=%d "
+                    "diffusion=%.3f diffusion_points=%d mpc_steps=%d "
+                    "join=%s manager_ms=%.3f"
                     % (
                         trajectory_update.reason,
                         trajectory_update.candidate_accepted,
                         len(active_traj),
                         trajectory_update.remaining_length_m,
-                        trajectory_update.history_length_m,
-                        trajectory_update.history_point_count,
-                        trajectory_update.far_length_m,
+                        trajectory_update.blind_length_m,
+                        trajectory_update.blind_point_count,
+                        trajectory_update.diffusion_length_m,
+                        trajectory_update.diffusion_point_count,
+                        trajectory_update.mpc_prediction_steps,
                         "nan"
                         if trajectory_update.join_distance_m is None
                         else f"{trajectory_update.join_distance_m:.3f}",
@@ -1252,7 +1270,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trajectory-join-distance", type=float, default=0.50)
     parser.add_argument("--trajectory-join-heading-deg", type=float, default=60.0)
     parser.add_argument("--trajectory-min-remaining", type=float, default=0.20)
-    parser.add_argument("--trajectory-history-distance", type=float, default=1.0)
     parser.add_argument("--arrival-distance", type=float, default=0.2)
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)

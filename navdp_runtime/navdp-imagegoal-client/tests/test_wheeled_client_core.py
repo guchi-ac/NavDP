@@ -1394,8 +1394,26 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("TrajectoryManager(", source)
         self.assertIn("candidate_eligible=critic_safe", source)
         self.assertIn("active_traj = trajectory_update.active_traj", source)
-        self.assertIn("self.mpc.update_ref_traj(active_traj)", source)
+        self.assertIn(
+            "N=trajectory_update.diffusion_point_count",
+            source,
+        )
+        self.assertIn(
+            "blind_steps=trajectory_update.blind_point_count",
+            source,
+        )
         self.assertNotIn("self.mpc.update_ref_traj(world_xy)", source)
+
+    def test_client_rebuilds_mpc_only_for_changed_total_horizon(self):
+        source = self.client_source()
+
+        self.assertIn(
+            "self.mpc.prediction_steps\n"
+            "                            != trajectory_update.mpc_prediction_steps",
+            source,
+        )
+        self.assertIn("self.mpc = Mpc_controller(", source)
+        self.assertIn("self.mpc.update_ref_traj(", source)
 
     def test_client_gates_control_on_active_trajectory(self):
         source = self.client_source()
@@ -1431,19 +1449,16 @@ class RosClientSourceTests(unittest.TestCase):
             '--trajectory-join-distance", type=float, default=0.50',
             '--trajectory-join-heading-deg", type=float, default=60.0',
             '--trajectory-min-remaining", type=float, default=0.20',
-            '--trajectory-history-distance", type=float, default=1.0',
         ):
             self.assertIn(required, source)
 
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("--trajectory-history-distance", help_result.stdout)
+        self.assertNotIn("--trajectory-history-distance", help_result.stdout)
         self.assertNotIn("--trajectory-commit-horizon", help_result.stdout)
         self.assertNotIn("--trajectory-overlap-length", help_result.stdout)
         self.assertNotIn("--trajectory-overlap-distance", help_result.stdout)
-        self.assertIn(
-            "history_distance=args.trajectory_history_distance",
-            source,
-        )
+        self.assertNotIn("trajectory_history_distance", source)
+        self.assertNotIn("history_distance=", source)
 
     def test_client_records_candidate_decision_and_active_trajectory(self):
         source = self.client_source()
@@ -1457,16 +1472,22 @@ class RosClientSourceTests(unittest.TestCase):
             "trajectory_update.join_distance_m",
             '"trajectory_remaining_length_m"',
             "trajectory_update.remaining_length_m",
-            '"trajectory_history_length_m"',
-            "trajectory_update.history_length_m",
-            '"trajectory_history_point_count"',
-            "trajectory_update.history_point_count",
-            '"trajectory_far_length_m"',
-            "trajectory_update.far_length_m",
+            '"trajectory_blind_length_m"',
+            "trajectory_update.blind_length_m",
+            '"trajectory_blind_point_count"',
+            "trajectory_update.blind_point_count",
+            '"trajectory_diffusion_length_m"',
+            "trajectory_update.diffusion_length_m",
+            '"trajectory_diffusion_point_count"',
+            "trajectory_update.diffusion_point_count",
+            '"mpc_prediction_steps"',
+            "trajectory_update.mpc_prediction_steps",
             '"trajectory_manager_update_ms"',
             "trajectory_update.manager_update_ms",
         ):
             self.assertIn(required, source)
+        self.assertNotIn('"trajectory_history_length_m"', source)
+        self.assertNotIn('"trajectory_far_length_m"', source)
         self.assertNotIn('"trajectory_preserved_length_m"', source)
         self.assertNotIn('"trajectory_overlap_error_m"', source)
 
