@@ -868,6 +868,15 @@ class NavdpImageGoalClient(Node):
                         "trajectory_diffusion_point_count": (
                             trajectory_update.diffusion_point_count
                         ),
+                        "trajectory_diffusion_spacing_m": (
+                            trajectory_update.diffusion_spacing_m
+                        ),
+                        "trajectory_projection_advance_m": (
+                            trajectory_update.projection_advance_m
+                        ),
+                        "trajectory_blind_max_turn_deg": (
+                            trajectory_update.blind_max_turn_degrees
+                        ),
                         "mpc_prediction_steps": (
                             trajectory_update.mpc_prediction_steps
                         ),
@@ -883,6 +892,7 @@ class NavdpImageGoalClient(Node):
                     "active trajectory: reason=%s accepted=%s points=%d "
                     "remaining=%.3f blind=%.3f blind_points=%d "
                     "diffusion=%.3f diffusion_points=%d mpc_steps=%d "
+                    "spacing=%.3f advance=%.3f blind_turn=%.3f "
                     "join=%s manager_ms=%.3f"
                     % (
                         trajectory_update.reason,
@@ -894,6 +904,9 @@ class NavdpImageGoalClient(Node):
                         trajectory_update.diffusion_length_m,
                         trajectory_update.diffusion_point_count,
                         trajectory_update.mpc_prediction_steps,
+                        trajectory_update.diffusion_spacing_m,
+                        trajectory_update.projection_advance_m,
+                        trajectory_update.blind_max_turn_degrees,
                         "nan"
                         if trajectory_update.join_distance_m is None
                         else f"{trajectory_update.join_distance_m:.3f}",
