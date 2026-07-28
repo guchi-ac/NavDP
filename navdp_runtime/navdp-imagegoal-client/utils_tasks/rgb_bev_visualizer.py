@@ -103,11 +103,19 @@ def _draw_path(
     base_xy: Optional[np.ndarray],
     color: Tuple[int, int, int],
     config: BevConfig,
+    thickness: int = 4,
 ) -> None:
     if base_xy is None or len(base_xy) < 2:
         return
     pixels = _base_xy_to_pixels(np.asarray(base_xy)[:, :2], config)
-    cv2.polylines(image, [pixels], False, color, 4, cv2.LINE_AA)
+    cv2.polylines(
+        image,
+        [pixels],
+        False,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 def velocity_overlay_lines(
@@ -191,6 +199,7 @@ def render_mpc_rgb_bev(
     config: BevConfig,
     actual_velocity: Optional[np.ndarray] = None,
     active_traj: Optional[np.ndarray] = None,
+    selected_diffusion: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     image = np.zeros((config.size_px, config.size_px, 3), dtype=np.uint8)
     points, colors, ranges = backproject_rgbd_to_base(
@@ -232,6 +241,18 @@ def render_mpc_rgb_bev(
             )
         _draw_path(image, actual_base, (0, 255, 0), config)
         _draw_path(image, predicted_base, (0, 0, 255), config)
+        if selected_diffusion is not None:
+            selected_base = world_xy_to_current_base(
+                np.asarray(selected_diffusion)[:, :2],
+                current_odom_xy_yaw,
+            )
+            _draw_path(
+                image,
+                selected_base,
+                (255, 255, 0),
+                config,
+                thickness=2,
+            )
         if active_traj is not None:
             guide_base = world_xy_to_current_base(
                 np.asarray(active_traj)[:, :2],
@@ -301,11 +322,22 @@ def render_mpc_rgb_bev(
         1,
         cv2.LINE_AA,
     )
-    cv2.line(image, (195, 96), (219, 96), (0, 255, 255), 3)
+    cv2.line(image, (195, 96), (219, 96), (255, 255, 0), 3)
+    cv2.putText(
+        image,
+        "selected",
+        (225, 102),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.line(image, (315, 96), (339, 96), (0, 255, 255), 3)
     cv2.putText(
         image,
         "guide",
-        (225, 102),
+        (345, 102),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
         (255, 255, 255),
@@ -315,7 +347,7 @@ def render_mpc_rgb_bev(
     cv2.putText(
         image,
         f"{odom_status}  {mpc_status}",
-        (280, 102),
+        (410, 102),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
         (255, 255, 255),

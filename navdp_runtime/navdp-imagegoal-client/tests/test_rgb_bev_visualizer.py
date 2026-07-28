@@ -161,6 +161,33 @@ class RenderingTests(unittest.TestCase):
 
         np.testing.assert_array_equal(frame[360, 360], [0, 0, 255])
 
+    def test_draws_cyan_selected_diffusion_under_yellow_guide_points(self):
+        frame = render_mpc_rgb_bev(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            np.zeros((2, 2), dtype=np.float32),
+            np.eye(3),
+            np.eye(4),
+            current_odom_xy_yaw=np.zeros(3),
+            odom_history=np.empty((0, 3)),
+            predicted_states=None,
+            selected_diffusion=np.array(
+                [[0.50, -0.50], [0.50, 0.50]],
+            ),
+            active_traj=np.array(
+                [[0.50, 0.50], [0.55, 0.50]],
+            ),
+            command=np.zeros(2),
+            solve_ms=None,
+            odom_status="ODOM OK",
+            mpc_status="MPC OK",
+            config=BevConfig(sample_stride=1),
+        )
+
+        np.testing.assert_array_equal(frame[495, 405], [255, 255, 0])
+        np.testing.assert_array_equal(frame[495, 315], [0, 255, 255])
+        np.testing.assert_array_equal(frame[96, 205], [255, 255, 0])
+        np.testing.assert_array_equal(frame[96, 325], [0, 255, 255])
+
     def test_draws_discrete_guide_points_and_robot_over_the_chassis_anchor(self):
         frame = render_mpc_rgb_bev(
             np.zeros((2, 2, 3), dtype=np.uint8),
@@ -195,8 +222,8 @@ class RenderingTests(unittest.TestCase):
         self.assertGreater(frame[486, 315, 1], 200)
         self.assertGreater(frame[486, 315, 2], 200)
         self.assertTrue((frame[484, 315] < 80).all())
-        self.assertGreater(frame[96, 205, 1], 200)
-        self.assertGreater(frame[96, 205, 2], 200)
+        self.assertGreater(frame[96, 325, 1], 200)
+        self.assertGreater(frame[96, 325, 2], 200)
 
         chassis_anchor = render_mpc_rgb_bev(
             np.zeros((2, 2, 3), dtype=np.uint8),
