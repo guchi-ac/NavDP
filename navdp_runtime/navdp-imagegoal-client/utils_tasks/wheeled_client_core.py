@@ -750,6 +750,114 @@ def transform_matrix_from_translation_quaternion(
     return transform
 
 
+def navdp_virtual_pixels(
+    local_xy: np.ndarray,
+    intrinsic: np.ndarray,
+    image_height: int,
+    virtual_camera_height: float = 0.2,
+) -> np.ndarray:
+    local_xy = np.asarray(local_xy, dtype=np.float64)
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    if local_xy.ndim != 2 or local_xy.shape[1] != 2 or len(local_xy) < 2:
+        raise ValueError(
+            "virtual_reprojection: local_xy must have shape (N, 2), N >= 2"
+        )
+    if intrinsic.shape != (3, 3) or not np.isfinite(intrinsic).all():
+        raise ValueError(
+            "virtual_reprojection: intrinsic must be finite shape (3, 3)"
+        )
+    if (
+        isinstance(image_height, (bool, np.bool_))
+        or not isinstance(image_height, (int, np.integer))
+        or image_height <= 0
+    ):
+        raise ValueError("virtual_reprojection: image_height must be positive")
+    if not np.isfinite(virtual_camera_height) or virtual_camera_height <= 0.0:
+        raise ValueError(
+            "virtual_reprojection: virtual camera height must be positive"
+        )
+    if not np.isfinite(local_xy).all():
+        raise ValueError("virtual_reprojection: local_xy must be finite")
+    forward = local_xy[:, 0]
+    if np.any(forward <= 0.0):
+        raise ValueError(
+            "virtual_reprojection: forward distance must be positive"
+        )
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError(
+            "virtual_reprojection: focal lengths must be positive"
+        )
+    u = fx * (-local_xy[:, 1] / forward) + cx
+    v = (
+        float(image_height - 1)
+        + fy * (virtual_camera_height / forward)
+        - cy
+    )
+    return np.column_stack((u, v))
+
+
+def reproject_navdp_to_ground_base(
+    local_xy: np.ndarray,
+    intrinsic: np.ndarray,
+    image_height: int,
+    base_from_camera: np.ndarray,
+    virtual_camera_height: float = 0.2,
+) -> np.ndarray:
+    pixels = navdp_virtual_pixels(
+        local_xy,
+        intrinsic,
+        image_height,
+        virtual_camera_height,
+    )
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    base_from_camera = np.asarray(base_from_camera, dtype=np.float64)
+    if (
+        base_from_camera.shape != (4, 4)
+        or not np.isfinite(base_from_camera).all()
+    ):
+        raise ValueError(
+            "virtual_reprojection: base_from_camera must be finite shape (4, 4)"
+        )
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    camera_rays = np.column_stack(
+        (
+            (pixels[:, 0] - cx) / fx,
+            (pixels[:, 1] - cy) / fy,
+            np.ones(len(pixels)),
+        )
+    )
+    base_rays = camera_rays @ base_from_camera[:3, :3].T
+    camera_origin = base_from_camera[:3, 3]
+    vertical = base_rays[:, 2]
+    if np.any(np.abs(vertical) <= np.finfo(np.float64).eps):
+        raise ValueError(
+            "virtual_reprojection: ray is parallel to ground"
+        )
+    scales = -camera_origin[2] / vertical
+    if np.any(scales <= 0.0):
+        raise ValueError(
+            "virtual_reprojection: ground intersection is behind camera"
+        )
+    base_points = camera_origin + scales[:, None] * base_rays
+    base_xy = base_points[:, :2]
+    if not np.isfinite(base_xy).all():
+        raise ValueError(
+            "virtual_reprojection: ground intersection must be finite"
+        )
+    if np.any(base_xy[:, 0] <= 0.0):
+        raise ValueError(
+            "virtual_reprojection: ground intersection must be forward"
+        )
+    if np.any(np.diff(base_xy[:, 0]) < -1e-6):
+        raise ValueError(
+            "virtual_reprojection: trajectory reverses forward progress"
+        )
+    return base_xy
+
+
 def trajectory_to_world(
     local_xy: np.ndarray,
     odom_xy_yaw: np.ndarray,

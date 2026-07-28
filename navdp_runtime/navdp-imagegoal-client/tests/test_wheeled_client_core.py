@@ -22,6 +22,166 @@ from utils_tasks.wheeled_client_core import (
 
 
 class GeometryTests(unittest.TestCase):
+    @staticmethod
+    def level_optical_transform(height):
+        transform = np.eye(4)
+        transform[:3, :3] = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ]
+        )
+        transform[:3, 3] = [0.0, 0.0, height]
+        return transform
+
+    def test_navdp_virtual_pixels_match_official_height_formula(self):
+        intrinsic = np.array(
+            [[100.0, 0.0, 2.0], [0.0, 120.0, 2.0], [0.0, 0.0, 1.0]]
+        )
+        local_xy = np.array([[1.0, 0.5], [2.0, -0.5]])
+
+        pixels = client_core.navdp_virtual_pixels(
+            local_xy,
+            intrinsic,
+            image_height=5,
+            virtual_camera_height=0.2,
+        )
+
+        np.testing.assert_allclose(
+            pixels,
+            [[-48.0, 26.0], [27.0, 14.0]],
+            atol=1e-12,
+        )
+
+    def test_navdp_virtual_pixels_reject_nonpositive_forward_point(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: forward distance must be positive",
+        ):
+            client_core.navdp_virtual_pixels(
+                np.array([[0.0, 0.0], [1.0, 0.0]]),
+                np.eye(3),
+                image_height=5,
+            )
+
+    def test_virtual_height_equals_real_height_reprojects_identity(self):
+        intrinsic = np.array(
+            [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+        )
+        local_xy = np.array([[0.5, -0.1], [1.0, 0.2], [2.0, 0.4]])
+
+        ground = client_core.reproject_navdp_to_ground_base(
+            local_xy,
+            intrinsic,
+            image_height=5,
+            base_from_camera=self.level_optical_transform(0.2),
+            virtual_camera_height=0.2,
+        )
+
+        np.testing.assert_allclose(ground, local_xy, atol=1e-12)
+
+    def test_pitched_camera_uses_full_optical_rotation(self):
+        intrinsic = np.array(
+            [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+        )
+        level = self.level_optical_transform(1.0)
+        pitch = math.radians(20.0)
+        pitch_rotation = np.array(
+            [
+                [math.cos(pitch), 0.0, math.sin(pitch)],
+                [0.0, 1.0, 0.0],
+                [-math.sin(pitch), 0.0, math.cos(pitch)],
+            ]
+        )
+        pitched = level.copy()
+        pitched[:3, :3] = pitch_rotation @ level[:3, :3]
+        local_xy = np.array([[1.0, 0.0], [2.0, 0.0]])
+
+        ground = client_core.reproject_navdp_to_ground_base(
+            local_xy,
+            intrinsic,
+            image_height=5,
+            base_from_camera=pitched,
+            virtual_camera_height=0.2,
+        )
+
+        first_ray = pitch_rotation @ np.array([1.0, 0.0, -0.2])
+        second_ray = pitch_rotation @ np.array([1.0, 0.0, -0.1])
+        expected = np.array(
+            [
+                [-first_ray[0] / first_ray[2], 0.0],
+                [-second_ray[0] / second_ray[2], 0.0],
+            ]
+        )
+        np.testing.assert_allclose(ground, expected, atol=1e-12)
+
+    def test_ground_reprojection_rejects_parallel_ray(self):
+        transform = np.eye(4)
+        transform[:3, :3] = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ]
+        )
+        transform[:3, 3] = [0.0, 0.0, 1.0]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: ray is parallel to ground",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[1.0, 0.0], [2.0, 0.0]]),
+                np.array(
+                    [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+                ),
+                image_height=5,
+                base_from_camera=transform,
+            )
+
+    def test_ground_reprojection_rejects_intersection_behind_camera(self):
+        transform = self.level_optical_transform(-1.0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: ground intersection is behind camera",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[1.0, 0.0], [2.0, 0.0]]),
+                np.array(
+                    [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+                ),
+                image_height=5,
+                base_from_camera=transform,
+            )
+
+    def test_ground_reprojection_rejects_nan_local_input(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: local_xy must be finite",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[1.0, 0.0], [np.nan, 0.0]]),
+                np.eye(3),
+                image_height=5,
+                base_from_camera=self.level_optical_transform(0.2),
+            )
+
+    def test_ground_reprojection_rejects_reversed_forward_progress(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: trajectory reverses forward progress",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[2.0, 0.0], [1.0, 0.0]]),
+                np.array(
+                    [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+                ),
+                image_height=5,
+                base_from_camera=self.level_optical_transform(0.2),
+            )
+
     def test_pending_selected_survives_failed_install_and_rejected_retry(self):
         old = np.array([[0.0, 0.0], [1.0, 0.0]])
         accepted = np.array([[0.5, 0.2], [1.5, 0.4]])
