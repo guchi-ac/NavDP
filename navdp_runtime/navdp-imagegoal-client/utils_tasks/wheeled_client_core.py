@@ -102,8 +102,8 @@ class TrajectoryManager:
                     history,
                     history_length_m,
                 )
-                candidate_from_chassis = self._resample_polyline(
-                    self._normalize_polyline(np.vstack((chassis, candidate)))
+                candidate_from_chassis = self._normalize_polyline(
+                    np.vstack((chassis, candidate))
                 )
                 candidate_length = self._polyline_length(
                     candidate_from_chassis
@@ -122,16 +122,34 @@ class TrajectoryManager:
                         reason = "join_distance"
                     else:
                         if join_distance_m <= self.point_spacing:
-                            candidate_far[0] = history_prefix[-1]
-                            candidate_far = self._normalize_polyline(
-                                candidate_far
-                            )
-                            heading_deltas = [
-                                self._heading_delta(
-                                    history_prefix[-1] - history_prefix[-2],
-                                    candidate_far[1] - candidate_far[0],
+                            distinct_far_indices = np.flatnonzero(
+                                np.linalg.norm(
+                                    candidate_far - history_prefix[-1],
+                                    axis=1,
                                 )
-                            ]
+                                > self.point_spacing + 1e-9
+                            )
+                            if len(distinct_far_indices) == 0:
+                                candidate_far = None
+                                reason = "candidate_too_short"
+                            else:
+                                candidate_far = self._normalize_polyline(
+                                    np.vstack(
+                                        (
+                                            history_prefix[-1],
+                                            candidate_far[
+                                                distinct_far_indices[0] :
+                                            ],
+                                        )
+                                    )
+                                )
+                                heading_deltas = [
+                                    self._heading_delta(
+                                        history_prefix[-1]
+                                        - history_prefix[-2],
+                                        candidate_far[1] - candidate_far[0],
+                                    )
+                                ]
                         else:
                             connector_heading = (
                                 candidate_far[0] - history_prefix[-1]
@@ -146,15 +164,16 @@ class TrajectoryManager:
                                     candidate_far[1] - candidate_far[0],
                                 ),
                             ]
-                        if max(heading_deltas) > self.join_heading:
-                            reason = "join_heading"
-                        else:
-                            combined = self._normalize_polyline(
-                                np.vstack((history_prefix, candidate_far))
-                            )
-                            active = self._resample_polyline(combined)
-                            accepted = True
-                            reason = "candidate_replaced_far"
+                        if candidate_far is not None:
+                            if max(heading_deltas) > self.join_heading:
+                                reason = "join_heading"
+                            else:
+                                combined = self._normalize_polyline(
+                                    np.vstack((history_prefix, candidate_far))
+                                )
+                                active = self._resample_polyline(combined)
+                                accepted = True
+                                reason = "candidate_replaced_far"
 
         if active is None and had_history and candidate_world_xy is None:
             reason = "history_exhausted"

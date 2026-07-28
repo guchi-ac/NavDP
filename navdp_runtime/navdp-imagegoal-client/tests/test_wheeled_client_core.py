@@ -191,6 +191,27 @@ class TrajectoryManagerTests(unittest.TestCase):
             atol=1e-9,
         )
 
+    def test_candidate_boundary_uses_original_polyline_arc_at_sharp_corner(self):
+        manager = self.make_manager(join_heading_degrees=180.0)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[1.0, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[0.99, 0.0], [0.99, 1.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        self.assertAlmostEqual(
+            result.join_distance_m,
+            math.sqrt(2.0) * 0.01,
+            places=7,
+        )
+
     def test_short_history_can_be_extended_by_far_candidate(self):
         manager = self.make_manager()
         manager.update(
@@ -320,6 +341,24 @@ class TrajectoryManagerTests(unittest.TestCase):
             float(np.max(heading_changes)),
             math.radians(60.0),
         )
+
+    def test_collapsed_far_segment_retains_history_without_raising(self):
+        manager = self.make_manager()
+        previous = manager.update(
+            [0.0, 0.0],
+            np.array([[1.0, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
+        ).active_traj
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[0.99, 0.01], [1.0, 0.0]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "candidate_too_short")
+        np.testing.assert_array_equal(result.active_traj, previous)
 
     def test_low_critic_candidate_retains_history_until_exhausted(self):
         manager = self.make_manager(min_remaining=0.20)
