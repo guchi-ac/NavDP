@@ -214,13 +214,18 @@ GPU 服务端官方 MP4 在 HTTP 响应返回前生成；客户端 MP4 记录 10
 角速度；里程计缺失或过期时实际速度显示为 `nan`。
 
 MPC BEV 视频的图层从下到上包括绿色 `actual` 实走里程计、红色 `MPC` 预测
-轨迹、黄色 `guide` 离散引导点，以及最后绘制的白色底盘矩形和方向箭头。黄色
-点是 `TrajectoryManager.active_traj` 在送入 MPC 稠密化前的 `0.05 m` 离散
-路径，不是 MPC 控制器内部的稠密 `ref_traj`；第一个较大点表示底盘锚点。只有
-MPC 快照新鲜且里程计为 `ODOM OK` 时才显示红色 MPC 预测和黄色引导点；里程计
-过期时两者都会隐藏，避免在过期坐标系中显示路径。黄色路径（以及所有 odom
-坐标系路径）使用该 RGB-D 帧捕获时的里程计位姿变换到相机当前底盘坐标，而不是
-渲染时更新的 live odom；live odom 的时间戳仍用于新鲜度判定。
+轨迹、青色 `selected` 原始 selected diffusion、黄色 `guide` 离散引导点，
+以及最后绘制的白色底盘矩形和方向箭头。青线只在候选被
+`TrajectoryManager` 接纳并成功安装进 MPC 后更新；候选被拒绝时继续显示与
+当前 MPC 参考对应的上一次 selected diffusion。黄色点是
+`TrajectoryManager.active_traj` 在送入 MPC 稠密化前的离散路径，不是 MPC
+控制器内部的稠密 `ref_traj`；第一个较大点表示底盘锚点。青黄两层的分离直接
+表示原始 selected diffusion 经轨迹管理后发生的变化。
+
+只有 MPC 快照新鲜且里程计为 `ODOM OK` 时才显示红色 MPC 预测、青色 selected
+和黄色 guide；里程计过期时三者都会隐藏，避免在过期坐标系中显示路径。这些
+odom 坐标系路径使用该 RGB-D 帧捕获时的里程计位姿变换到相机当前底盘坐标，
+而不是渲染时更新的 live odom；live odom 的时间戳仍用于新鲜度判定。
 
 相关渲染器和客户端源代码测试：
 
