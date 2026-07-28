@@ -36,7 +36,10 @@ selected diffusion 保存为当前已安装 selected。
 把“最新生成但未执行”的候选误画成当前控制参考。
 
 只有在候选已被接纳且 MPC 安装成功后，才更新已安装 selected。安装失败时
-保留旧值；`active_traj` 耗尽且控制参考变为不可用时清空它。
+保留旧值；同时把已接纳候选作为 pending provenance 保留下来。后续即使新
+候选被拒绝，只要由该 pending 候选延续出的 active trajectory 成功安装，
+就把 pending 提升为 installed。`active_traj` 耗尽且控制参考变为不可用时
+同时清空 pending 和 installed。
 
 控制线程在每次 MPC 求解成功后，同时复制以下只读数据到同一个
 `MpcVisualizationSnapshot`：
@@ -63,8 +66,9 @@ selected diffusion 保存为当前已安装 selected。
 
 `MpcVisualizationSnapshot` 增加只读的 `selected_diffusion` 数组。
 
-客户端增加当前已安装 selected 的状态，并在成功安装被接纳候选时更新它。
-重建 MPC 和原地更新 MPC 参考两条分支使用相同的更新规则。
+客户端增加 `SelectedDiffusionInstallState` 两阶段状态：候选被接纳时
+`stage` 为 pending，MPC 安装成功后 `commit` 为 installed。重建 MPC 和
+原地更新 MPC 参考两条分支使用相同的更新规则。
 
 `render_mpc_rgb_bev(...)` 增加可选参数 `selected_diffusion`。调用方传入
 odom 坐标二维点；渲染器负责坐标转换、青色折线绘制和图例更新。
@@ -76,6 +80,8 @@ odom 坐标二维点；渲染器负责坐标转换、青色折线绘制和图例
 - 客户端源代码测试验证 MPC 快照携带 selected，并传入 BEV 渲染器。
 - 轨迹安装测试验证被接纳候选更新已安装 selected。
 - 拒绝候选测试验证未采用的新候选不会覆盖已安装 selected。
+- 失败重试测试验证已接纳候选在 MPC 安装失败后保留 pending provenance，
+  并在后续历史轨迹安装成功时正确提升。
 - 运行现有 RGB BEV、客户端和轨迹管理相关测试，确认没有控制行为回归。
 
 ## 非目标

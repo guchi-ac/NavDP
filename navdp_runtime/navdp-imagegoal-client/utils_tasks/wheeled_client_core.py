@@ -27,17 +27,36 @@ class TrajectoryUpdate:
     manager_update_ms: float
 
 
-def update_installed_selected_diffusion(
-    installed,
-    candidate_world_xy,
-    candidate_accepted: bool,
-) -> Optional[np.ndarray]:
-    selected = candidate_world_xy if candidate_accepted else installed
-    if selected is None:
-        return None
-    result = np.asarray(selected, dtype=np.float64).copy()
-    result.setflags(write=False)
-    return result
+@dataclass(frozen=True)
+class SelectedDiffusionInstallState:
+    installed: Optional[np.ndarray] = None
+    pending: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _readonly_copy(points) -> np.ndarray:
+        result = np.asarray(points, dtype=np.float64).copy()
+        result.setflags(write=False)
+        return result
+
+    def stage(
+        self,
+        candidate_world_xy,
+        candidate_accepted: bool,
+    ):
+        if not candidate_accepted:
+            return self
+        return SelectedDiffusionInstallState(
+            installed=self.installed,
+            pending=self._readonly_copy(candidate_world_xy),
+        )
+
+    def commit(self):
+        if self.pending is None:
+            return self
+        return SelectedDiffusionInstallState(installed=self.pending)
+
+    def clear(self):
+        return SelectedDiffusionInstallState()
 
 
 class TrajectoryManager:

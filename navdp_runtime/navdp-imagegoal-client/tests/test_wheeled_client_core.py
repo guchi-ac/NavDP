@@ -22,37 +22,41 @@ from utils_tasks.wheeled_client_core import (
 
 
 class GeometryTests(unittest.TestCase):
-    def test_accepted_candidate_replaces_installed_selected_diffusion(self):
-        installed = np.array([[0.0, 0.0], [1.0, 0.0]])
-        candidate = np.array([[0.5, 0.2], [1.5, 0.4]])
+    def test_pending_selected_survives_failed_install_and_rejected_retry(self):
+        old = np.array([[0.0, 0.0], [1.0, 0.0]])
+        accepted = np.array([[0.5, 0.2], [1.5, 0.4]])
+        rejected = np.array([[0.5, 1.0], [1.5, 1.0]])
+        state = client_core.SelectedDiffusionInstallState()
+        state = state.stage(old, candidate_accepted=True).commit()
 
-        result = client_core.update_installed_selected_diffusion(
-            installed,
-            candidate,
+        state = state.stage(accepted, candidate_accepted=True)
+        state = state.stage(rejected, candidate_accepted=False)
+        state = state.commit()
+
+        np.testing.assert_array_equal(state.installed, accepted)
+        self.assertIsNone(state.pending)
+        self.assertFalse(state.installed.flags.writeable)
+        accepted[0] = [9.0, 9.0]
+        np.testing.assert_array_equal(
+            state.installed,
+            [[0.5, 0.2], [1.5, 0.4]],
+        )
+
+    def test_unavailable_trajectory_clears_selected_provenance(self):
+        state = client_core.SelectedDiffusionInstallState()
+        state = state.stage(
+            np.array([[0.0, 0.0], [1.0, 0.0]]),
+            candidate_accepted=True,
+        ).commit()
+        state = state.stage(
+            np.array([[0.5, 0.2], [1.5, 0.4]]),
             candidate_accepted=True,
         )
 
-        np.testing.assert_array_equal(result, candidate)
-        self.assertFalse(result.flags.writeable)
-        self.assertIsNot(result, candidate)
-        candidate[0] = [9.0, 9.0]
-        np.testing.assert_array_equal(result, [[0.5, 0.2], [1.5, 0.4]])
+        state = state.clear()
 
-    def test_rejected_candidate_retains_installed_selected_diffusion(self):
-        installed = np.array([[0.0, 0.0], [1.0, 0.0]])
-        rejected = np.array([[0.5, 1.0], [1.5, 1.0]])
-
-        result = client_core.update_installed_selected_diffusion(
-            installed,
-            rejected,
-            candidate_accepted=False,
-        )
-
-        np.testing.assert_array_equal(result, installed)
-        self.assertFalse(result.flags.writeable)
-        self.assertIsNot(result, installed)
-        installed[0] = [9.0, 9.0]
-        np.testing.assert_array_equal(result, [[0.0, 0.0], [1.0, 0.0]])
+        self.assertIsNone(state.installed)
+        self.assertIsNone(state.pending)
 
     def test_pitch20_d435_mount_points_rgb_optical_axis_down_20_degrees(self):
         base_from_mount = client_core.transform_matrix_from_translation_quaternion(
@@ -1732,11 +1736,12 @@ class RosClientSourceTests(unittest.TestCase):
             "active_traj: np.ndarray",
             "selected_diffusion: Optional[np.ndarray]",
             "self.installed_active_traj: Optional[np.ndarray] = None",
-            "self.installed_selected_diffusion: Optional[np.ndarray] = None",
+            "self.selected_diffusion_state = SelectedDiffusionInstallState()",
             "self.installed_active_traj = np.asarray(active_traj).copy()",
             "self.installed_active_traj.setflags(write=False)",
             "active_traj_snapshot = self.installed_active_traj.copy()",
             "active_traj_snapshot.setflags(write=False)",
+            "self.selected_diffusion_state.installed",
             "active_traj=active_traj_snapshot",
             "selected_diffusion=selected_diffusion_snapshot",
             "active_traj = None",
@@ -1766,7 +1771,7 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertLess(active_traj_assignment, render_call)
         self.assertLess(selected_assignment, selected_render_call)
 
-    def test_client_updates_selected_only_after_successful_mpc_install(self):
+    def test_client_stages_selected_before_install_and_commits_after_success(self):
         source = self.client_source()
         tree = ast.parse(source)
         planning_method = next(
@@ -1802,14 +1807,21 @@ class RosClientSourceTests(unittest.TestCase):
                 and call.func.attr == "update_ref_traj"
             )
         ]
-        selected_update = next(
+        selected_stage = next(
             call
             for call in install_calls
-            if isinstance(call.func, ast.Name)
-            and call.func.id == "update_installed_selected_diffusion"
+            if isinstance(call.func, ast.Attribute)
+            and call.func.attr == "stage"
+        )
+        selected_commit = next(
+            call
+            for call in install_calls
+            if isinstance(call.func, ast.Attribute)
+            and call.func.attr == "commit"
         )
 
-        self.assertGreater(selected_update.lineno, max(mpc_install_lines))
+        self.assertLess(selected_stage.lineno, min(mpc_install_lines))
+        self.assertGreater(selected_commit.lineno, max(mpc_install_lines))
 
     def test_client_hides_odom_frame_paths_when_odom_is_stale_but_mpc_is_fresh(self):
         source = self.client_source()

@@ -4,7 +4,7 @@
 
 **Goal:** Render the original selected diffusion associated with the currently installed MPC reference as a cyan line in `mpc_rgb_bev.mp4`.
 
-**Architecture:** Store selected diffusion in the odom frame only after its accepted trajectory is successfully installed into MPC. Copy that installed selection into the same immutable visualization snapshot as the active guide and MPC prediction, then transform and draw all three paths with the RGB-D frame pose.
+**Architecture:** Stage accepted selected diffusion as pending provenance before MPC installation and promote it to installed only after installation succeeds. This preserves provenance across a failed install followed by a rejected-candidate history retry. Copy the installed selection into the same immutable visualization snapshot as the active guide and MPC prediction, then transform and draw all three paths with the RGB-D frame pose.
 
 **Tech Stack:** Python 3, NumPy, OpenCV, `unittest`, ROS2 client source integration.
 
@@ -159,8 +159,8 @@ git commit -m "feat: draw selected diffusion in MPC BEV"
 - Modify: `navdp_runtime/navdp-imagegoal-client/scripts/realworld/navdp_imagegoal_client.py:1062-1099`
 
 **Interfaces:**
-- Produces:
-  `update_installed_selected_diffusion(installed, candidate_world_xy, candidate_accepted) -> Optional[np.ndarray]`.
+- Produces: immutable `SelectedDiffusionInstallState(installed, pending)` with
+  `stage()`, `commit()`, and `clear()` transitions.
 - Produces: `MpcVisualizationSnapshot.selected_diffusion:
   Optional[np.ndarray]`.
 - Consumes: Task 1
@@ -168,40 +168,24 @@ git commit -m "feat: draw selected diffusion in MPC BEV"
 
 - [ ] **Step 1: Write failing accepted/rejected state tests**
 
-Add tests using literal arrays:
+Add tests using literal arrays. The regression sequence is:
 
 ```python
-def test_accepted_candidate_replaces_installed_selected_diffusion(self):
+def test_pending_selected_survives_failed_install_and_rejected_retry(self):
     old = np.array([[0.0, 0.0], [1.0, 0.0]])
-    candidate = np.array([[0.5, 0.2], [1.5, 0.4]])
-
-    result = client_core.update_installed_selected_diffusion(
-        old,
-        candidate,
-        candidate_accepted=True,
-    )
-
-    np.testing.assert_array_equal(result, candidate)
-    self.assertFalse(result.flags.writeable)
-    self.assertIsNot(result, candidate)
-
-def test_rejected_candidate_retains_installed_selected_diffusion(self):
-    old = np.array([[0.0, 0.0], [1.0, 0.0]])
+    accepted = np.array([[0.5, 0.2], [1.5, 0.4]])
     rejected = np.array([[0.5, 1.0], [1.5, 1.0]])
-
-    result = client_core.update_installed_selected_diffusion(
-        old,
-        rejected,
-        candidate_accepted=False,
-    )
-
-    np.testing.assert_array_equal(result, old)
-    self.assertFalse(result.flags.writeable)
-    self.assertIsNot(result, old)
+    state = client_core.SelectedDiffusionInstallState()
+    state = state.stage(old, candidate_accepted=True).commit()
+    state = state.stage(accepted, candidate_accepted=True)
+    state = state.stage(rejected, candidate_accepted=False)
+    state = state.commit()
+    np.testing.assert_array_equal(state.installed, accepted)
 ```
 
-The production mutation these tests catch is selecting the latest generated
-candidate unconditionally instead of the candidate installed in MPC.
+Also verify `clear()` removes both installed and pending provenance. The
+production mutation these tests catch is losing accepted provenance after a
+failed MPC install.
 
 - [ ] **Step 2: Run the state tests and verify red**
 
@@ -215,25 +199,35 @@ PYTHONPATH=. python -m unittest \
   -v
 ```
 
-Expected: errors because `update_installed_selected_diffusion` does not
-exist.
+Expected: errors because `SelectedDiffusionInstallState` does not exist.
 
 - [ ] **Step 3: Implement the immutable state transition**
 
-Add:
+Add an immutable state with:
 
 ```python
-def update_installed_selected_diffusion(
-    installed,
-    candidate_world_xy,
-    candidate_accepted: bool,
-) -> Optional[np.ndarray]:
-    selected = candidate_world_xy if candidate_accepted else installed
-    if selected is None:
-        return None
-    result = np.asarray(selected, dtype=np.float64).copy()
-    result.setflags(write=False)
-    return result
+@dataclass(frozen=True)
+class SelectedDiffusionInstallState:
+    installed: Optional[np.ndarray] = None
+    pending: Optional[np.ndarray] = None
+
+    def stage(self, candidate_world_xy, candidate_accepted):
+        if not candidate_accepted:
+            return self
+        pending = np.asarray(candidate_world_xy, dtype=np.float64).copy()
+        pending.setflags(write=False)
+        return SelectedDiffusionInstallState(
+            installed=self.installed,
+            pending=pending,
+        )
+
+    def commit(self):
+        if self.pending is None:
+            return self
+        return SelectedDiffusionInstallState(installed=self.pending)
+
+    def clear(self):
+        return SelectedDiffusionInstallState()
 ```
 
 - [ ] **Step 4: Run the state tests and verify green**
@@ -248,7 +242,7 @@ Extend the existing AST-backed MPC visualization tests to require:
 
 ```python
 selected_diffusion: Optional[np.ndarray]
-self.installed_selected_diffusion: Optional[np.ndarray] = None
+self.selected_diffusion_state = SelectedDiffusionInstallState()
 selected_diffusion=selected_diffusion_snapshot
 selected_diffusion = mpc_snapshot.selected_diffusion
 selected_diffusion=selected_diffusion
@@ -283,19 +277,18 @@ field, and initialize:
 self.installed_selected_diffusion: Optional[np.ndarray] = None
 ```
 
-After MPC construction/update and active trajectory installation succeed:
+Stage before MPC construction/update:
 
 ```python
-self.installed_selected_diffusion = (
-    update_installed_selected_diffusion(
-        self.installed_selected_diffusion,
-        retained_world_xy,
-        trajectory_update.candidate_accepted,
-    )
+self.selected_diffusion_state = self.selected_diffusion_state.stage(
+    retained_world_xy,
+    trajectory_update.candidate_accepted,
 )
 ```
 
-When `active_traj is None`, clear installed selected under `self.mpc_lock`.
+After MPC construction/update succeeds, call
+`self.selected_diffusion_state.commit()`. When `active_traj is None`, call
+`clear()` under `self.mpc_lock`.
 During a successful solve, copy installed selected into a read-only
 `selected_diffusion_snapshot`, add it to `MpcVisualizationSnapshot`, gate it
 beside the other odom-frame paths in `_render_mpc_bev`, and pass it to

@@ -59,6 +59,7 @@ from utils_tasks.visualization_utils import VisualizationManager
 from utils_tasks.wheeled_client_core import (
     JsonlWriter,
     PostureActionRunner,
+    SelectedDiffusionInstallState,
     TrajectoryManager,
     camera_pose_from_transform,
     control_stop_reason,
@@ -68,7 +69,6 @@ from utils_tasks.wheeled_client_core import (
     run_navdp_startup,
     trajectory_to_world,
     transform_matrix_from_translation_quaternion,
-    update_installed_selected_diffusion,
     yaw_from_quaternion,
 )
 
@@ -175,7 +175,7 @@ class NavdpImageGoalClient(Node):
         self.frame_sequence = 0
         self.mpc = None
         self.installed_active_traj: Optional[np.ndarray] = None
-        self.installed_selected_diffusion: Optional[np.ndarray] = None
+        self.selected_diffusion_state = SelectedDiffusionInstallState()
         self.last_plan_time = None
         self.plan_sequence = 0
         self.latest_plan_id = None
@@ -679,7 +679,9 @@ class NavdpImageGoalClient(Node):
             )
             if active_traj is None:
                 with self.mpc_lock:
-                    self.installed_selected_diffusion = None
+                    self.selected_diffusion_state = (
+                        self.selected_diffusion_state.clear()
+                    )
                 with self.data_lock:
                     self.trajectory_ready = False
                 if trajectory_update is not None:
@@ -690,6 +692,12 @@ class NavdpImageGoalClient(Node):
             else:
                 try:
                     with self.mpc_lock:
+                        self.selected_diffusion_state = (
+                            self.selected_diffusion_state.stage(
+                                retained_world_xy,
+                                trajectory_update.candidate_accepted,
+                            )
+                        )
                         if (
                             self.mpc is None
                             or self.mpc.prediction_steps
@@ -711,12 +719,8 @@ class NavdpImageGoalClient(Node):
                             )
                         self.installed_active_traj = np.asarray(active_traj).copy()
                         self.installed_active_traj.setflags(write=False)
-                        self.installed_selected_diffusion = (
-                            update_installed_selected_diffusion(
-                                self.installed_selected_diffusion,
-                                retained_world_xy,
-                                trajectory_update.candidate_accepted,
-                            )
+                        self.selected_diffusion_state = (
+                            self.selected_diffusion_state.commit()
                         )
                 except Exception as error:
                     with self.data_lock:
@@ -1093,8 +1097,8 @@ class NavdpImageGoalClient(Node):
                             active_traj_snapshot.setflags(write=False)
                             selected_diffusion_snapshot = (
                                 None
-                                if self.installed_selected_diffusion is None
-                                else self.installed_selected_diffusion.copy()
+                                if self.selected_diffusion_state.installed is None
+                                else self.selected_diffusion_state.installed.copy()
                             )
                             if selected_diffusion_snapshot is not None:
                                 selected_diffusion_snapshot.setflags(write=False)
