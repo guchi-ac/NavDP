@@ -258,13 +258,14 @@ def render_mpc_rgb_bev(
                 np.asarray(active_traj)[:, :2],
                 current_odom_xy_yaw,
             )
-            for index, (guide_col, guide_row) in enumerate(
-                _base_xy_to_pixels(guide_base, config)
+            for guide_col, guide_row in _base_xy_to_pixels(
+                guide_base,
+                config,
             ):
                 cv2.circle(
                     image,
                     (int(guide_col), int(guide_row)),
-                    4 if index == 0 else 1,
+                    3,
                     (0, 255, 255),
                     -1,
                 )
