@@ -93,7 +93,9 @@ Allow path-specific thickness:
 
 ```python
 def _draw_path(image, base_xy, color, config, thickness=4):
-    ...
+    if base_xy is None or len(base_xy) < 2:
+        return
+    pixels = _base_xy_to_pixels(np.asarray(base_xy)[:, :2], config)
     cv2.polylines(
         image,
         [pixels],
