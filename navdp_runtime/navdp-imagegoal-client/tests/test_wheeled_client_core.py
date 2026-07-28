@@ -2,6 +2,8 @@ import ast
 import json
 import math
 import queue
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1404,24 +1406,38 @@ class RosClientSourceTests(unittest.TestCase):
 
     def test_client_exposes_trajectory_manager_defaults(self):
         source = self.client_source()
+        client_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "realworld"
+            / "navdp_imagegoal_client.py"
+        )
+        help_result = subprocess.run(
+            [sys.executable, str(client_path), "--help"],
+            cwd=client_path.parents[2],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
 
         for required in (
             '--trajectory-point-spacing", type=float, default=0.05',
             '--trajectory-join-distance", type=float, default=0.50',
             '--trajectory-join-heading-deg", type=float, default=60.0',
             '--trajectory-min-remaining", type=float, default=0.20',
-            '--trajectory-commit-horizon", type=float, default=1.0',
-            '--trajectory-overlap-length", type=float, default=0.5',
-            '--trajectory-overlap-distance", type=float, default=0.30',
+            '--trajectory-history-distance", type=float, default=1.0',
         ):
             self.assertIn(required, source)
 
-        for required in (
-            "commit_horizon=args.trajectory_commit_horizon",
-            "overlap_length=args.trajectory_overlap_length",
-            "overlap_distance=args.trajectory_overlap_distance",
-        ):
-            self.assertIn(required, source)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--trajectory-history-distance", help_result.stdout)
+        self.assertNotIn("--trajectory-commit-horizon", help_result.stdout)
+        self.assertNotIn("--trajectory-overlap-length", help_result.stdout)
+        self.assertNotIn("--trajectory-overlap-distance", help_result.stdout)
+        self.assertIn(
+            "history_distance=args.trajectory_history_distance",
+            source,
+        )
 
     def test_client_records_candidate_decision_and_active_trajectory(self):
         source = self.client_source()
@@ -1435,12 +1451,18 @@ class RosClientSourceTests(unittest.TestCase):
             "trajectory_update.join_distance_m",
             '"trajectory_remaining_length_m"',
             "trajectory_update.remaining_length_m",
-            '"trajectory_preserved_length_m"',
-            "trajectory_update.preserved_length_m",
-            '"trajectory_overlap_error_m"',
-            "trajectory_update.overlap_error_m",
+            '"trajectory_history_length_m"',
+            "trajectory_update.history_length_m",
+            '"trajectory_history_point_count"',
+            "trajectory_update.history_point_count",
+            '"trajectory_far_length_m"',
+            "trajectory_update.far_length_m",
+            '"trajectory_manager_update_ms"',
+            "trajectory_update.manager_update_ms",
         ):
             self.assertIn(required, source)
+        self.assertNotIn('"trajectory_preserved_length_m"', source)
+        self.assertNotIn('"trajectory_overlap_error_m"', source)
 
     def test_bev_uses_rgbd_snapshot_odom_as_the_render_pose(self):
         source = self.client_source()

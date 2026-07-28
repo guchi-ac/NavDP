@@ -114,7 +114,7 @@ Run:
 
 ```bash
 cd navdp_runtime/navdp-imagegoal-client
-PYTHONPATH=. python tests/test_wheeled_client_core.py \
+PYTHONPATH=".:${PYTHONPATH}" python tests/test_wheeled_client_core.py \
   TrajectoryManagerTests -v
 ```
 
@@ -180,7 +180,7 @@ Run:
 
 ```bash
 cd navdp_runtime/navdp-imagegoal-client
-PYTHONPATH=. python tests/test_wheeled_client_core.py \
+PYTHONPATH=".:${PYTHONPATH}" python tests/test_wheeled_client_core.py \
   TrajectoryManagerTests -v
 ```
 
@@ -250,7 +250,7 @@ Run:
 
 ```bash
 cd navdp_runtime/navdp-imagegoal-client
-PYTHONPATH=. python tests/test_wheeled_client_core.py \
+PYTHONPATH=".:${PYTHONPATH}" python tests/test_wheeled_client_core.py \
   RosClientSourceTests.test_client_exposes_trajectory_manager_defaults \
   RosClientSourceTests.test_client_records_candidate_decision_and_active_trajectory \
   -v
@@ -286,7 +286,7 @@ Run:
 
 ```bash
 cd navdp_runtime/navdp-imagegoal-client
-PYTHONPATH=. python tests/test_wheeled_client_core.py \
+PYTHONPATH=".:${PYTHONPATH}" python tests/test_wheeled_client_core.py \
   RosClientSourceTests.test_client_exposes_trajectory_manager_defaults \
   RosClientSourceTests.test_client_records_candidate_decision_and_active_trajectory \
   -v
@@ -349,7 +349,7 @@ Run:
 ```bash
 cd navdp_runtime/navdp-imagegoal-client
 for run in 1 2 3 4 5; do
-  PYTHONPATH=. python tests/test_wheeled_client_core.py \
+  PYTHONPATH=".:${PYTHONPATH}" python tests/test_wheeled_client_core.py \
     TrajectoryManagerTests.test_seventy_point_update_completes_within_realtime_budget \
     -v || exit 1
 done
