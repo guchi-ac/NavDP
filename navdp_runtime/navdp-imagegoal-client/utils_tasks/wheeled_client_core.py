@@ -22,6 +22,9 @@ class TrajectoryUpdate:
     blind_point_count: int
     diffusion_length_m: float
     diffusion_point_count: int
+    diffusion_spacing_m: float
+    projection_advance_m: float
+    blind_max_turn_degrees: float
     mpc_prediction_steps: int
     remaining_length_m: float
     manager_update_ms: float
@@ -93,6 +96,7 @@ class TrajectoryManager:
         self._blind_point_count = 0
         self._diffusion_length_m = 0.0
         self._diffusion_point_count = 0
+        self._blind_max_turn_degrees = 0.0
 
     def update(
         self,
@@ -106,7 +110,7 @@ class TrajectoryManager:
             raise ValueError("chassis_xy must be a finite shape-(2,) point")
 
         had_history = self._history_centerline is not None
-        history = self._advance_centerline(chassis)
+        history, projection_advance_m = self._advance_centerline(chassis)
         active = self._build_active_trajectory(chassis)
         accepted = False
         join_distance_m = None
@@ -141,7 +145,13 @@ class TrajectoryManager:
                     connector_length,
                     spacing,
                 )
-                if (
+                if not self._first_distinct_reference_is_forward(
+                    chassis,
+                    proposed_centerline,
+                    proposed_active,
+                ):
+                    reason = "candidate_nonforward"
+                elif (
                     self._polyline_length(proposed_active)
                     >= self.min_remaining
                 ):
@@ -228,7 +238,13 @@ class TrajectoryManager:
                             proposed_start_arc,
                             proposed_spacing,
                         )
-                        if (
+                        if not self._first_distinct_reference_is_forward(
+                            chassis,
+                            proposed_centerline,
+                            proposed,
+                        ):
+                            reason = "candidate_nonforward"
+                        elif (
                             self._polyline_length(proposed)
                             < self.min_remaining
                         ):
@@ -275,6 +291,13 @@ class TrajectoryManager:
             blind_point_count=self._blind_point_count,
             diffusion_length_m=self._diffusion_length_m,
             diffusion_point_count=self._diffusion_point_count,
+            diffusion_spacing_m=(
+                0.0
+                if self._active_traj is None
+                else self._diffusion_spacing
+            ),
+            projection_advance_m=projection_advance_m,
+            blind_max_turn_degrees=self._blind_max_turn_degrees,
             mpc_prediction_steps=(
                 self._blind_point_count + self._diffusion_point_count
             ),
@@ -401,12 +424,36 @@ class TrajectoryManager:
             diffusion_spacing,
         )
         blind_guides = self._sample_at_arcs(centerline, blind_arcs)
+        tangent = centerline[1] - centerline[0]
+        blind_guides = np.asarray(
+            [
+                point
+                for point in blind_guides
+                if np.dot(point - chassis, tangent) > 0.0
+            ],
+            dtype=np.float64,
+        ).reshape(-1, 2)
         active = self._assemble_active_trajectory(
             chassis,
             blind_guides,
             candidate,
         )
         return active, blind_guides
+
+    @staticmethod
+    def _first_distinct_reference_is_forward(
+        chassis: np.ndarray,
+        centerline: np.ndarray,
+        active: np.ndarray,
+    ) -> bool:
+        tangent = centerline[1] - centerline[0]
+        for point in active[1:]:
+            if (
+                np.linalg.norm(point - chassis)
+                > np.finfo(np.float64).eps
+            ):
+                return bool(np.dot(point - chassis, tangent) > 0.0)
+        return False
 
     def _build_active_trajectory(self, chassis: np.ndarray):
         if (
@@ -421,6 +468,12 @@ class TrajectoryManager:
             self._diffusion_start_arc,
             self._diffusion_spacing,
         )
+        if not self._first_distinct_reference_is_forward(
+            chassis,
+            self._history_centerline,
+            active,
+        ):
+            return None
         self._set_candidate_metadata(
             chassis,
             blind_guides,
@@ -451,6 +504,9 @@ class TrajectoryManager:
         self._blind_point_count = len(blind_guides)
         self._diffusion_length_m = self._polyline_length(candidate)
         self._diffusion_point_count = len(candidate)
+        self._blind_max_turn_degrees = self._maximum_turn_degrees(
+            blind_path
+        )
 
     def _clear_persistent_state(self):
         self._history_centerline = None
@@ -462,17 +518,56 @@ class TrajectoryManager:
         self._blind_point_count = 0
         self._diffusion_length_m = 0.0
         self._diffusion_point_count = 0
+        self._blind_max_turn_degrees = 0.0
+
+    @classmethod
+    def _maximum_turn_degrees(cls, points: np.ndarray) -> float:
+        if len(points) < 3:
+            return 0.0
+        deltas = np.diff(points, axis=0)
+        deltas = deltas[
+            np.linalg.norm(deltas, axis=1)
+            > np.finfo(np.float64).eps
+        ]
+        if len(deltas) < 2:
+            return 0.0
+        headings = np.arctan2(deltas[:, 1], deltas[:, 0])
+        turns = np.abs(
+            np.arctan2(
+                np.sin(np.diff(headings)),
+                np.cos(np.diff(headings)),
+            )
+        )
+        return math.degrees(float(np.max(turns)))
 
     @staticmethod
     def _projection_with_arc(
         polyline: np.ndarray,
         cumulative: np.ndarray,
         point: np.ndarray,
+        maximum_arc: Optional[float] = None,
     ):
-        best = (math.inf, 0, polyline[0], 0.0)
+        best = (
+            float(np.linalg.norm(point - polyline[0])),
+            0,
+            polyline[0],
+            0.0,
+        )
         for index, (start, end) in enumerate(zip(polyline[:-1], polyline[1:])):
             segment = end - start
             segment_length = float(np.linalg.norm(segment))
+            available_length = segment_length
+            if maximum_arc is not None:
+                available_length = min(
+                    segment_length,
+                    float(maximum_arc - cumulative[index]),
+                )
+                if available_length <= np.finfo(np.float64).eps:
+                    break
+                end = start + segment * (
+                    available_length / segment_length
+                )
+                segment = end - start
             fraction = float(
                 np.clip(
                     np.dot(point - start, segment) / np.dot(segment, segment),
@@ -484,18 +579,64 @@ class TrajectoryManager:
             distance = float(np.linalg.norm(point - projection))
             if distance < best[0] - 1e-9:
                 projection_arc = float(
-                    cumulative[index] + fraction * segment_length
+                    cumulative[index] + fraction * available_length
                 )
                 best = (distance, index, projection, projection_arc)
+            if (
+                maximum_arc is not None
+                and cumulative[index] + available_length
+                >= maximum_arc - 1e-9
+            ):
+                break
         return best
+
+    def _advance_diffusion_suffix(self, projection_arc: float) -> bool:
+        if self._diffusion_tail is None:
+            return False
+        if projection_arc <= self._diffusion_start_arc + 1e-9:
+            self._diffusion_start_arc = max(
+                0.0,
+                self._diffusion_start_arc - projection_arc,
+            )
+            return True
+
+        passed_in_diffusion = projection_arc - self._diffusion_start_arc
+        candidate_cumulative = self._cumulative_lengths(
+            self._diffusion_tail
+        )
+        keep_index = int(
+            np.searchsorted(
+                candidate_cumulative,
+                passed_in_diffusion,
+                side="right",
+            )
+        )
+        if keep_index >= len(self._diffusion_tail):
+            return False
+        next_point_arc = float(candidate_cumulative[keep_index])
+        self._diffusion_tail = self._diffusion_tail[keep_index:].copy()
+        self._diffusion_start_arc = (
+            next_point_arc - passed_in_diffusion
+        )
+        return True
 
     def _advance_centerline(self, chassis: np.ndarray):
         if self._history_centerline is None:
-            return None
+            return None, 0.0
+        displacement = (
+            0.0
+            if self._last_chassis is None
+            else float(np.linalg.norm(chassis - self._last_chassis))
+        )
+        maximum_arc = min(
+            self._polyline_length(self._history_centerline),
+            displacement + self._diffusion_spacing,
+        )
         _, _, _, projection_arc = self._projection_with_arc(
             self._history_centerline,
             self._cumulative_lengths(self._history_centerline),
             chassis,
+            maximum_arc=maximum_arc,
         )
         forward_length = (
             self._polyline_length(self._history_centerline)
@@ -503,16 +644,16 @@ class TrajectoryManager:
         )
         if forward_length < self.min_remaining:
             self._clear_persistent_state()
-            return None
-        self._history_centerline = self._trim_from_arc(
+            return None, projection_arc
+        trimmed_centerline = self._trim_from_arc(
             self._history_centerline,
             projection_arc,
         )
-        self._diffusion_start_arc = max(
-            0.0,
-            self._diffusion_start_arc - projection_arc,
-        )
-        return self._history_centerline
+        if not self._advance_diffusion_suffix(projection_arc):
+            self._clear_persistent_state()
+            return None, projection_arc
+        self._history_centerline = trimmed_centerline
+        return self._history_centerline, projection_arc
 
     @staticmethod
     def _heading_delta(first: np.ndarray, second: np.ndarray) -> float:

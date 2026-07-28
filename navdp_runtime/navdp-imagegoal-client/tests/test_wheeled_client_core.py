@@ -370,6 +370,89 @@ class TrajectoryManagerTests(unittest.TestCase):
             math.radians(15.0),
         )
 
+    def test_chassis_projection_cannot_jump_across_self_crossing_centerline(self):
+        manager = self.make_manager(point_spacing=0.05)
+        candidate = np.array(
+            [
+                [0.30, 0.01],
+                [0.60, 0.30],
+                [0.30, 0.60],
+                [0.0, 0.30],
+                [0.30, 0.0],
+                [0.60, -0.30],
+            ]
+        )
+        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
+
+        result = manager.update([0.30, 0.0])
+
+        self.assertLessEqual(
+            result.projection_advance_m,
+            0.30 + result.diffusion_spacing_m + 1e-9,
+        )
+        np.testing.assert_array_equal(result.active_traj[0], [0.30, 0.0])
+
+    def test_fallback_prunes_passed_diffusion_points_without_reversing(self):
+        manager = self.make_manager(point_spacing=0.05)
+        candidate = np.array(
+            [[0.30, 0.0], [0.45, 0.0], [0.60, 0.0], [0.75, 0.0]]
+        )
+        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
+
+        result = manager.update([0.47, 0.0])
+
+        np.testing.assert_array_equal(
+            result.active_traj[-2:],
+            [[0.60, 0.0], [0.75, 0.0]],
+        )
+        self.assertEqual(result.diffusion_point_count, 2)
+        self.assertTrue(np.all(np.diff(result.active_traj[:, 0]) > 0.0))
+
+    def test_first_distinct_reference_is_forward_of_chassis(self):
+        manager = self.make_manager(point_spacing=0.05)
+        candidate = np.array(
+            [[0.60, 0.0], [0.75, 0.0], [0.90, 0.0]]
+        )
+        manager.update([0.0, 0.0], candidate, candidate_eligible=True)
+
+        result = manager.update([0.02, 0.03])
+        first = next(
+            point
+            for point in result.active_traj[1:]
+            if np.linalg.norm(point - result.active_traj[0]) > 1e-9
+        )
+
+        self.assertGreater(
+            np.dot(first - result.active_traj[0], [1.0, 0.0]),
+            0.0,
+        )
+
+    def test_rejects_candidate_whose_first_sample_reverses_centerline_progress(self):
+        manager = self.make_manager(
+            point_spacing=0.05,
+            join_heading_degrees=180.0,
+        )
+        previous = manager.update(
+            [0.0, 0.0],
+            np.array(
+                [[0.2, 0.0], [0.2, 0.1], [-0.2, 0.1], [-0.4, 0.1]]
+            ),
+            candidate_eligible=True,
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[-0.2, 0.1], [-0.85, 0.1], [-1.5, 0.1]]),
+            candidate_eligible=True,
+        )
+
+        self.assertFalse(result.candidate_accepted)
+        self.assertEqual(result.reason, "candidate_nonforward")
+        np.testing.assert_array_equal(
+            result.active_traj,
+            previous.active_traj,
+        )
+
     def test_blind_history_is_not_capped_at_one_meter(self):
         manager = self.make_manager(point_spacing=0.10)
         manager.update(
