@@ -173,20 +173,17 @@ def normalize_tracking_trajectory(points) -> np.ndarray:
         raise ValueError(
             "trajectory must be finite with shape (N, 2), N >= 2"
         )
-    keep = np.concatenate(
-        (
-            np.array([True]),
-            np.linalg.norm(np.diff(points, axis=0), axis=1)
-            > np.finfo(np.float64).eps,
-        )
-    )
-    result = points[keep]
-    if len(result) < 2:
+    if not np.any(
+        np.linalg.norm(points - points[0], axis=1)
+        > np.finfo(np.float64).eps
+    ):
         raise ValueError("trajectory must contain two distinct points")
-    return result
+    return points
 ```
 
-Remove `TrajectoryUpdate`, `TrajectoryManager`, and manager-only helpers.
+This validation must preserve every input point, including consecutive
+duplicates, so the upstream index-based interpolation is unchanged. Remove
+`TrajectoryUpdate`, `TrajectoryManager`, and manager-only helpers.
 
 - [ ] **Step 4: Rewire the planning thread**
 

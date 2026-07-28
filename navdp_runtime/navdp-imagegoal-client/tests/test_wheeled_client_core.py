@@ -189,9 +189,29 @@ class GeometryTests(unittest.TestCase):
 
         normalized = client_core.normalize_tracking_trajectory(trajectory)
 
-        np.testing.assert_array_equal(
-            normalized,
-            [[0.5, 0.1], [1.0, 0.2], [1.5, 0.4]],
+        np.testing.assert_array_equal(normalized, trajectory)
+
+    def test_tracking_generation_rejects_a_result_after_invalidation(self):
+        self.assertTrue(
+            client_core.tracking_generation_is_current(
+                captured_generation=4,
+                current_generation=4,
+                trajectory_ready=True,
+            )
+        )
+        self.assertFalse(
+            client_core.tracking_generation_is_current(
+                captured_generation=4,
+                current_generation=5,
+                trajectory_ready=True,
+            )
+        )
+        self.assertFalse(
+            client_core.tracking_generation_is_current(
+                captured_generation=4,
+                current_generation=4,
+                trajectory_ready=False,
+            )
         )
 
     def test_rejects_invalid_direct_tracking_trajectory(self):
@@ -844,13 +864,10 @@ class RosClientSourceTests(unittest.TestCase):
             "raw_selected_world_xy",
             "reprojected_base_xy",
             "reprojected_world_xy",
-            "retained_raw_world_xy",
-            "retained_reprojected_world_xy",
             "normalize_tracking_trajectory(\n"
-            "                        retained_reprojected_world_xy\n"
+            "                        reprojected_world_xy\n"
             "                    )",
-            "self.selected_diffusion_state.stage(\n"
-            "                                retained_raw_world_xy,",
+            ".stage(raw_selected_world_xy, True)",
         ):
             self.assertIn(required, source)
         self.assertNotIn("TrajectoryManager", source)
@@ -866,8 +883,9 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("reprojection_error = None", source)
         self.assertIn("except ValueError as error:", source)
         self.assertIn("reprojection_error = str(error)", source)
-        self.assertIn("retained_reprojected_world_xy = None", source)
+        self.assertIn("reprojected_world_xy = None", source)
         self.assertIn("self.installed_active_traj = None", source)
+        self.assertIn("self._invalidate_tracking_state()", source)
         self.assertNotIn("trajectory_manager.update", source)
 
     def test_client_exposes_virtual_camera_height_default(self):
@@ -897,9 +915,9 @@ class RosClientSourceTests(unittest.TestCase):
         source = self.client_source()
 
         for required in (
-            '"raw_selected_world_xy": retained_raw_world_xy',
+            '"raw_selected_world_xy": raw_selected_world_xy',
             '"reprojected_base_xy": reprojected_base_xy',
-            '"reprojected_world_xy": retained_reprojected_world_xy',
+            '"reprojected_world_xy": reprojected_world_xy',
             '"virtual_camera_height_m": self.args.virtual_camera_height',
             '"reprojection_status":',
             '"reprojection_reason": reprojection_error',
@@ -1322,37 +1340,32 @@ class RosClientSourceTests(unittest.TestCase):
             self.assertIn(required, source)
         self.assertNotIn("all_trajectories_rejected", source)
 
-    def test_client_visualizes_skipped_prefix_separately_from_mpc_trajectory(self):
-        client_path = (
-            Path(__file__).resolve().parents[1]
-            / "scripts"
-            / "realworld"
-            / "navdp_imagegoal_client.py"
-        )
-        source = client_path.read_text(encoding="utf-8")
+    def test_client_does_not_drop_a_configurable_diffusion_prefix(self):
+        source = self.client_source()
 
-        for required in (
-            "raw_local_xy",
-            "trajectory_prefix",
-            "trajectory_prefix_points=state.trajectory_prefix",
-        ):
-            self.assertIn(required, source)
+        self.assertNotIn("skip_trajectory_points", source)
+        self.assertNotIn("--skip-trajectory-points", source)
 
     def test_client_installs_complete_reprojected_diffusion_in_upstream_mpc(self):
         source = self.client_source()
 
-        self.assertIn("active_traj = normalize_tracking_trajectory(", source)
-        self.assertIn("self.mpc = Mpc_controller(", source)
+        self.assertIn(
+            "active_traj = normalize_tracking_trajectory(\n"
+            "                        reprojected_world_xy",
+            source,
+        )
+        self.assertIn("next_mpc = Mpc_controller(", source)
         self.assertIn("desired_v=self.args.max_v", source)
         self.assertNotIn("TrajectoryManager", source)
         self.assertNotIn("trajectory_update", source)
         self.assertNotIn("blind_steps=", source)
         self.assertNotIn("N=trajectory_update", source)
+        self.assertNotIn("retained_reprojected_world_xy", source)
 
     def test_client_rebuilds_upstream_mpc_for_every_valid_plan(self):
         source = self.client_source()
 
-        self.assertIn("self.mpc = Mpc_controller(", source)
+        self.assertIn("next_mpc = Mpc_controller(", source)
         self.assertNotIn("self.mpc.update_ref_traj(", source)
         self.assertNotIn("prediction_steps", source)
 
@@ -1368,6 +1381,15 @@ class RosClientSourceTests(unittest.TestCase):
 
         self.assertIn("failed to install active trajectory", source)
         self.assertIn('reason = "active_trajectory_error"', source)
+
+    def test_client_invalidates_inflight_control_and_bev_snapshot(self):
+        source = self.client_source()
+
+        self.assertIn("self.trajectory_generation += 1", source)
+        self.assertIn("self.latest_mpc_visualization = None", source)
+        self.assertIn("tracking_generation_is_current(", source)
+        self.assertIn("captured_generation=control_generation", source)
+        self.assertIn('reason = "plan_superseded"', source)
 
     def test_client_does_not_expose_trajectory_manager_options(self):
         source = self.client_source()
@@ -1396,7 +1418,7 @@ class RosClientSourceTests(unittest.TestCase):
         source = self.client_source()
 
         for required in (
-            '"reprojected_world_xy": retained_reprojected_world_xy',
+            '"reprojected_world_xy": reprojected_world_xy',
             '"active_traj": active_traj',
             '"mpc_horizon": self.mpc.N',
         ):
@@ -1556,8 +1578,9 @@ class RosClientSourceTests(unittest.TestCase):
             "selected_diffusion: Optional[np.ndarray]",
             "self.installed_active_traj: Optional[np.ndarray] = None",
             "self.selected_diffusion_state = SelectedDiffusionInstallState()",
-            "self.installed_active_traj = np.asarray(active_traj).copy()",
-            "self.installed_active_traj.setflags(write=False)",
+            "next_active_traj = np.asarray(active_traj).copy()",
+            "next_active_traj.setflags(write=False)",
+            "self.installed_active_traj = next_active_traj",
             "active_traj_snapshot = self.installed_active_traj.copy()",
             "active_traj_snapshot.setflags(write=False)",
             "self.selected_diffusion_state.installed",
@@ -1590,7 +1613,7 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertLess(active_traj_assignment, render_call)
         self.assertLess(selected_assignment, selected_render_call)
 
-    def test_client_stages_selected_before_install_and_commits_after_success(self):
+    def test_client_publishes_selected_only_after_mpc_construction(self):
         source = self.client_source()
         tree = ast.parse(source)
         planning_method = next(
@@ -1626,21 +1649,25 @@ class RosClientSourceTests(unittest.TestCase):
                 and call.func.attr == "update_ref_traj"
             )
         ]
-        selected_stage = next(
-            call
-            for call in install_calls
-            if isinstance(call.func, ast.Attribute)
-            and call.func.attr == "stage"
-        )
         selected_commit = next(
             call
             for call in install_calls
             if isinstance(call.func, ast.Attribute)
             and call.func.attr == "commit"
         )
+        selected_publish = next(
+            node
+            for node in ast.walk(install_try)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "selected_diffusion_state"
+                for target in node.targets
+            )
+        )
 
-        self.assertLess(selected_stage.lineno, min(mpc_install_lines))
         self.assertGreater(selected_commit.lineno, max(mpc_install_lines))
+        self.assertGreater(selected_publish.lineno, max(mpc_install_lines))
 
     def test_client_hides_odom_frame_paths_when_odom_is_stale_but_mpc_is_fresh(self):
         source = self.client_source()

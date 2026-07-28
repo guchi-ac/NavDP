@@ -56,17 +56,24 @@ def normalize_tracking_trajectory(points) -> np.ndarray:
         raise ValueError(
             "trajectory must be finite with shape (N, 2), N >= 2"
         )
-    keep = np.concatenate(
-        (
-            np.array([True]),
-            np.linalg.norm(np.diff(points, axis=0), axis=1)
-            > np.finfo(np.float64).eps,
-        )
-    )
-    result = points[keep]
-    if len(result) < 2:
+    if not np.any(
+        np.linalg.norm(points - points[0], axis=1)
+        > np.finfo(np.float64).eps
+    ):
         raise ValueError("trajectory must contain two distinct points")
-    return result
+    return points
+
+
+def tracking_generation_is_current(
+    *,
+    captured_generation: int,
+    current_generation: int,
+    trajectory_ready: bool,
+) -> bool:
+    return (
+        trajectory_ready
+        and captured_generation == current_generation
+    )
 
 
 

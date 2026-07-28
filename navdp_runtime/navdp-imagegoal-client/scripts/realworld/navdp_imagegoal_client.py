@@ -68,6 +68,7 @@ from utils_tasks.wheeled_client_core import (
     reproject_navdp_to_ground_base,
     resize_rgbd_for_visualization,
     run_navdp_startup,
+    tracking_generation_is_current,
     trajectory_to_world,
     transform_matrix_from_translation_quaternion,
     yaw_from_quaternion,
@@ -183,6 +184,7 @@ class NavdpImageGoalClient(Node):
         self.latest_plan_id = None
         self.arrival_blocked = False
         self.trajectory_ready = False
+        self.trajectory_generation = 0
         self.server_initialized = False
         self.last_control_log = 0.0
         self.last_control_reason = None
@@ -418,6 +420,18 @@ class NavdpImageGoalClient(Node):
             self.mpc_diagnostics_failed = True
             self.get_logger().error(f"MPC diagnostic logging disabled: {error}")
 
+    def _invalidate_tracking_state(self) -> None:
+        with self.data_lock:
+            self.trajectory_generation += 1
+            self.trajectory_ready = False
+            self.latest_mpc_visualization = None
+        with self.mpc_lock:
+            self.selected_diffusion_state = (
+                self.selected_diffusion_state.clear()
+            )
+            self.mpc = None
+            self.installed_active_traj = None
+
     def _publish_d435_mount_transform(self) -> None:
         transform = TransformStamped()
         transform.header.stamp = self.get_clock().now().to_msg()
@@ -528,10 +542,8 @@ class NavdpImageGoalClient(Node):
             critic_safe = False
             local_xy = None
             raw_selected_world_xy = None
-            retained_raw_world_xy = None
             reprojected_base_xy = None
             reprojected_world_xy = None
-            retained_reprojected_world_xy = None
             reprojection_error = None
             reprojection_status = "not_attempted"
             trajectory_prefix = np.empty((0, 2), dtype=np.float64)
@@ -611,7 +623,7 @@ class NavdpImageGoalClient(Node):
                 if raw_local_xy.ndim == 3:
                     raw_local_xy = raw_local_xy[0]
                 raw_local_xy = raw_local_xy[:, :2]
-                local_xy = raw_local_xy[self.args.skip_trajectory_points :]
+                local_xy = raw_local_xy
                 if len(local_xy) < 2 or not np.isfinite(local_xy).all():
                     raise ValueError(f"invalid NavDP trajectory shape: {local_xy.shape}")
                 raw_selected_world_xy = trajectory_to_world(
@@ -621,9 +633,6 @@ class NavdpImageGoalClient(Node):
                     camera_y=snapshot.camera_xy_yaw[1],
                     camera_yaw=snapshot.camera_xy_yaw[2],
                 )
-                retained_raw_world_xy = raw_selected_world_xy[
-                    self.args.skip_trajectory_points :
-                ]
                 try:
                     reprojected_base_xy = reproject_navdp_to_ground_base(
                         raw_local_xy,
@@ -636,21 +645,11 @@ class NavdpImageGoalClient(Node):
                         reprojected_base_xy,
                         snapshot.odom_xy_yaw,
                     )
-                    retained_reprojected_world_xy = reprojected_world_xy[
-                        self.args.skip_trajectory_points :
-                    ]
-                    prefix_end = self.args.skip_trajectory_points
-                    trajectory_prefix = np.vstack(
-                        (
-                            snapshot.odom_xy_yaw[:2],
-                            reprojected_world_xy[:prefix_end],
-                        )
-                    )
                     reprojection_status = "ok"
                 except ValueError as error:
                     reprojection_error = str(error)
                     reprojection_status = "rejected"
-                    retained_reprojected_world_xy = None
+                    reprojected_world_xy = None
                 candidate_world_xy = np.asarray(
                     [
                         trajectory_to_world(
@@ -664,11 +663,11 @@ class NavdpImageGoalClient(Node):
                     ]
                 )
                 if (
-                    retained_reprojected_world_xy is not None
+                    reprojected_world_xy is not None
                     and critic_safe
                 ):
                     active_traj = normalize_tracking_trajectory(
-                        retained_reprojected_world_xy
+                        reprojected_world_xy
                     )
                 self.visualization_state = VisualizationState(
                     trajectory=(
@@ -707,14 +706,7 @@ class NavdpImageGoalClient(Node):
                 self.get_logger().error(f"planning failed: {error}")
 
             if active_traj is None:
-                with self.mpc_lock:
-                    self.selected_diffusion_state = (
-                        self.selected_diffusion_state.clear()
-                    )
-                    self.mpc = None
-                    self.installed_active_traj = None
-                with self.data_lock:
-                    self.trajectory_ready = False
+                self._invalidate_tracking_state()
                 self._write_diagnostic(
                     {
                         "type": "plan",
@@ -725,9 +717,9 @@ class NavdpImageGoalClient(Node):
                         "snapshot_odom": snapshot.odom_xy_yaw,
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
-                        "raw_selected_world_xy": retained_raw_world_xy,
+                        "raw_selected_world_xy": raw_selected_world_xy,
                         "reprojected_base_xy": reprojected_base_xy,
-                        "reprojected_world_xy": retained_reprojected_world_xy,
+                        "reprojected_world_xy": reprojected_world_xy,
                         "virtual_camera_height_m": self.args.virtual_camera_height,
                         "reprojection_status": reprojection_status,
                         "reprojection_reason": reprojection_error,
@@ -739,33 +731,33 @@ class NavdpImageGoalClient(Node):
                 )
             else:
                 try:
+                    next_mpc = Mpc_controller(
+                        active_traj,
+                        desired_v=self.args.max_v,
+                        v_max=self.args.max_v,
+                        w_max=self.args.max_w,
+                    )
+                    next_active_traj = np.asarray(active_traj).copy()
+                    next_active_traj.setflags(write=False)
+                    next_selected_state = (
+                        SelectedDiffusionInstallState()
+                        .stage(raw_selected_world_xy, True)
+                        .commit()
+                    )
                     with self.mpc_lock:
-                        self.selected_diffusion_state = (
-                            self.selected_diffusion_state.stage(
-                                retained_raw_world_xy,
-                                True,
-                            )
-                        )
-                        self.mpc = Mpc_controller(
-                            active_traj,
-                            desired_v=self.args.max_v,
-                            v_max=self.args.max_v,
-                            w_max=self.args.max_w,
-                        )
-                        self.installed_active_traj = np.asarray(active_traj).copy()
-                        self.installed_active_traj.setflags(write=False)
-                        self.selected_diffusion_state = (
-                            self.selected_diffusion_state.commit()
-                        )
+                        self.mpc = next_mpc
+                        self.installed_active_traj = next_active_traj
+                        self.selected_diffusion_state = next_selected_state
+                        with self.data_lock:
+                            plan_ready = time.monotonic()
+                            self.trajectory_generation += 1
+                            self.trajectory_ready = True
+                            self.last_plan_time = plan_ready
+                            self.plan_sequence += 1
+                            self.latest_plan_id = self.plan_sequence
+                            plan_id = self.latest_plan_id
                 except Exception as error:
-                    with self.mpc_lock:
-                        self.mpc = None
-                        self.installed_active_traj = None
-                        self.selected_diffusion_state = (
-                            self.selected_diffusion_state.clear()
-                        )
-                    with self.data_lock:
-                        self.trajectory_ready = False
+                    self._invalidate_tracking_state()
                     reason = "active_trajectory_error"
                     self.get_logger().error(
                         f"failed to install active trajectory: {error}"
@@ -775,13 +767,6 @@ class NavdpImageGoalClient(Node):
                         max(0.0, self.args.plan_period - elapsed)
                     )
                     continue
-                with self.data_lock:
-                    plan_ready = time.monotonic()
-                    self.trajectory_ready = True
-                    self.last_plan_time = plan_ready
-                    self.plan_sequence += 1
-                    self.latest_plan_id = self.plan_sequence
-                    plan_id = self.latest_plan_id
                 if planning_error is not None and self.visualization_state is not None:
                     state = self.visualization_state
                     self.visualization_state = VisualizationState(
@@ -805,9 +790,9 @@ class NavdpImageGoalClient(Node):
                         "snapshot_odom": snapshot.odom_xy_yaw,
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
-                        "raw_selected_world_xy": retained_raw_world_xy,
+                        "raw_selected_world_xy": raw_selected_world_xy,
                         "reprojected_base_xy": reprojected_base_xy,
-                        "reprojected_world_xy": retained_reprojected_world_xy,
+                        "reprojected_world_xy": reprojected_world_xy,
                         "virtual_camera_height_m": self.args.virtual_camera_height,
                         "reprojection_status": reprojection_status,
                         "reprojection_reason": reprojection_error,
@@ -1060,6 +1045,7 @@ class NavdpImageGoalClient(Node):
                 last_odom_time = self.last_odom_time
                 last_plan_time = self.last_plan_time
                 plan_id = self.latest_plan_id
+                control_generation = self.trajectory_generation
                 reason = control_stop_reason(
                     now=cycle_start,
                     enable_control=self.args.enable_control,
@@ -1110,28 +1096,19 @@ class NavdpImageGoalClient(Node):
                             if selected_diffusion_snapshot is not None:
                                 selected_diffusion_snapshot.setflags(write=False)
                     if reason is None:
-                        linear = float(np.clip(controls[0, 0], 0.0, self.args.max_v))
-                        angular = float(
+                        proposed_linear = float(
+                            np.clip(controls[0, 0], 0.0, self.args.max_v)
+                        )
+                        proposed_angular = float(
                             np.clip(controls[0, 1], -self.args.max_w, self.args.max_w)
                         )
                         predicted_snapshot = np.asarray(predicted_states).copy()
                         predicted_snapshot.setflags(write=False)
                         command_snapshot = np.array(
-                            [linear, angular],
+                            [proposed_linear, proposed_angular],
                             dtype=np.float64,
                         )
                         command_snapshot.setflags(write=False)
-                        with self.data_lock:
-                            self.latest_mpc_visualization = (
-                                MpcVisualizationSnapshot(
-                                    predicted_states=predicted_snapshot,
-                                    active_traj=active_traj_snapshot,
-                                    selected_diffusion=selected_diffusion_snapshot,
-                                    command=command_snapshot,
-                                    solve_ms=float(solve_ms),
-                                    updated_at=time.monotonic(),
-                                )
-                            )
                 except Exception as error:
                     if solve_started is not None:
                         solve_ms = (
@@ -1140,7 +1117,30 @@ class NavdpImageGoalClient(Node):
                     reason = "mpc_error"
                     self.get_logger().error(f"MPC solve failed: {error}")
 
-            self._publish_velocity(linear, angular)
+            with self.data_lock:
+                if (
+                    reason is None
+                    and not tracking_generation_is_current(
+                        captured_generation=control_generation,
+                        current_generation=self.trajectory_generation,
+                        trajectory_ready=self.trajectory_ready,
+                    )
+                ):
+                    reason = "plan_superseded"
+                if reason is None:
+                    linear = proposed_linear
+                    angular = proposed_angular
+                    self.latest_mpc_visualization = (
+                        MpcVisualizationSnapshot(
+                            predicted_states=predicted_snapshot,
+                            active_traj=active_traj_snapshot,
+                            selected_diffusion=selected_diffusion_snapshot,
+                            command=command_snapshot,
+                            solve_ms=float(solve_ms),
+                            updated_at=time.monotonic(),
+                        )
+                    )
+                self._publish_velocity(linear, angular)
             self._write_diagnostic(
                 {
                     "type": "control",
@@ -1305,7 +1305,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)
     parser.add_argument("--min-inliers", type=int, default=6)
-    parser.add_argument("--skip-trajectory-points", type=int, default=0)
     parser.add_argument("--frame-timeout", type=float, default=1.0)
     parser.add_argument("--odom-timeout", type=float, default=0.5)
     parser.add_argument("--plan-timeout", type=float, default=1.5)
