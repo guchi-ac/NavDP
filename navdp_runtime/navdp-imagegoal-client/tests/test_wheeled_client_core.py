@@ -1232,6 +1232,39 @@ class RosClientSourceTests(unittest.TestCase):
         )
         return client_path.read_text(encoding="utf-8")
 
+    def test_client_routes_reprojected_path_to_manager_but_snapshots_raw_selected(self):
+        source = self.client_source()
+
+        for required in (
+            "reproject_navdp_to_ground_base",
+            "raw_selected_world_xy",
+            "reprojected_base_xy",
+            "reprojected_world_xy",
+            "retained_raw_world_xy",
+            "retained_reprojected_world_xy",
+            "candidate_world_xy=retained_reprojected_world_xy",
+            "self.selected_diffusion_state.stage(\n"
+            "                                retained_raw_world_xy,",
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn(
+            "candidate_world_xy=retained_raw_world_xy",
+            source,
+        )
+
+    def test_invalid_reprojection_advances_manager_without_new_candidate(self):
+        source = self.client_source()
+
+        self.assertIn("reprojection_error = None", source)
+        self.assertIn("except ValueError as error:", source)
+        self.assertIn("reprojection_error = str(error)", source)
+        self.assertIn(
+            "self.trajectory_manager.update(\n"
+            "                        snapshot.odom_xy_yaw[:2]\n"
+            "                    )",
+            source,
+        )
+
     def test_client_has_real_robot_inputs_and_explicit_control_gate(self):
         client_path = (
             Path(__file__).resolve().parents[1]

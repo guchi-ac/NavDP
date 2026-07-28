@@ -65,6 +65,7 @@ from utils_tasks.wheeled_client_core import (
     control_stop_reason,
     finalize_mp4,
     put_latest,
+    reproject_navdp_to_ground_base,
     resize_rgbd_for_visualization,
     run_navdp_startup,
     trajectory_to_world,
@@ -524,7 +525,12 @@ class NavdpImageGoalClient(Node):
             critic_max = None
             critic_safe = False
             local_xy = None
-            retained_world_xy = None
+            raw_selected_world_xy = None
+            retained_raw_world_xy = None
+            reprojected_base_xy = None
+            reprojected_world_xy = None
+            retained_reprojected_world_xy = None
+            reprojection_error = None
             trajectory_prefix = np.empty((0, 2), dtype=np.float64)
             candidate_world_xy = np.empty((0, 0, 2), dtype=np.float64)
             candidate_values = np.empty(0, dtype=np.float64)
@@ -608,23 +614,41 @@ class NavdpImageGoalClient(Node):
                 local_xy = raw_local_xy[self.args.skip_trajectory_points :]
                 if len(local_xy) < 2 or not np.isfinite(local_xy).all():
                     raise ValueError(f"invalid NavDP trajectory shape: {local_xy.shape}")
-                raw_world_xy = trajectory_to_world(
+                raw_selected_world_xy = trajectory_to_world(
                     raw_local_xy,
                     snapshot.odom_xy_yaw,
                     camera_x=snapshot.camera_xy_yaw[0],
                     camera_y=snapshot.camera_xy_yaw[1],
                     camera_yaw=snapshot.camera_xy_yaw[2],
                 )
-                retained_world_xy = raw_world_xy[
+                retained_raw_world_xy = raw_selected_world_xy[
                     self.args.skip_trajectory_points :
                 ]
-                prefix_end = self.args.skip_trajectory_points
-                trajectory_prefix = np.vstack(
-                    (
-                        snapshot.odom_xy_yaw[:2],
-                        raw_world_xy[:prefix_end],
+                try:
+                    reprojected_base_xy = reproject_navdp_to_ground_base(
+                        raw_local_xy,
+                        snapshot.intrinsic,
+                        snapshot.rgb_bgr.shape[0],
+                        snapshot.base_from_camera,
+                        self.args.virtual_camera_height,
                     )
-                )
+                    reprojected_world_xy = trajectory_to_world(
+                        reprojected_base_xy,
+                        snapshot.odom_xy_yaw,
+                    )
+                    retained_reprojected_world_xy = reprojected_world_xy[
+                        self.args.skip_trajectory_points :
+                    ]
+                    prefix_end = self.args.skip_trajectory_points
+                    trajectory_prefix = np.vstack(
+                        (
+                            snapshot.odom_xy_yaw[:2],
+                            reprojected_world_xy[:prefix_end],
+                        )
+                    )
+                except ValueError as error:
+                    reprojection_error = str(error)
+                    retained_reprojected_world_xy = None
                 candidate_world_xy = np.asarray(
                     [
                         trajectory_to_world(
@@ -637,11 +661,16 @@ class NavdpImageGoalClient(Node):
                         for candidate in candidate_local
                     ]
                 )
-                trajectory_update = self.trajectory_manager.update(
-                    snapshot.odom_xy_yaw[:2],
-                    retained_world_xy,
-                    candidate_eligible=critic_safe,
-                )
+                if retained_reprojected_world_xy is None:
+                    trajectory_update = self.trajectory_manager.update(
+                        snapshot.odom_xy_yaw[:2]
+                    )
+                else:
+                    trajectory_update = self.trajectory_manager.update(
+                        snapshot.odom_xy_yaw[:2],
+                        candidate_world_xy=retained_reprojected_world_xy,
+                        candidate_eligible=critic_safe,
+                    )
                 active_traj = trajectory_update.active_traj
                 self.visualization_state = VisualizationState(
                     trajectory=(
@@ -656,6 +685,16 @@ class NavdpImageGoalClient(Node):
                     arrived=False,
                 )
                 self._queue_visualization(snapshot)
+                if reprojection_error is not None:
+                    self.get_logger().warning(
+                        "NavDP virtual reprojection rejected: %s active=%s"
+                        % (
+                            reprojection_error,
+                            "retained"
+                            if active_traj is not None
+                            else "unavailable",
+                        )
+                    )
                 if not critic_safe:
                     self.get_logger().warning(
                         "NavDP candidate below critic threshold: "
@@ -694,7 +733,7 @@ class NavdpImageGoalClient(Node):
                     with self.mpc_lock:
                         self.selected_diffusion_state = (
                             self.selected_diffusion_state.stage(
-                                retained_world_xy,
+                                retained_raw_world_xy,
                                 trajectory_update.candidate_accepted,
                             )
                         )
@@ -764,8 +803,8 @@ class NavdpImageGoalClient(Node):
                         "snapshot_odom": snapshot.odom_xy_yaw,
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
-                        "navdp_world_xy": retained_world_xy,
-                        "candidate_world_xy": retained_world_xy,
+                        "navdp_world_xy": retained_raw_world_xy,
+                        "candidate_world_xy": retained_reprojected_world_xy,
                         "active_traj": active_traj,
                         "candidate_accepted": trajectory_update.candidate_accepted,
                         "trajectory_reason": trajectory_update.reason,
