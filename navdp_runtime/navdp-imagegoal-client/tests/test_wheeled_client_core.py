@@ -95,38 +95,86 @@ class TrajectoryManagerTests(unittest.TestCase):
             join_distance=0.50,
             join_heading_degrees=60.0,
             min_remaining=0.20,
-            history_distance=1.0,
         )
         values.update(changes)
         return client_core.TrajectoryManager(**values)
 
-    def test_new_candidate_replaces_only_path_beyond_one_meter(self):
-        manager = self.make_manager()
-        previous = manager.update(
+    def test_blind_history_ends_at_current_candidate_first_point_projection(self):
+        manager = self.make_manager(point_spacing=0.10)
+        manager.update(
             [0.0, 0.0],
-            np.array([[1.0, 0.0], [3.0, 0.0]]),
+            np.array([[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]),
             candidate_eligible=True,
-        ).active_traj
-
+        )
         result = manager.update(
             [0.0, 0.0],
-            np.array([[1.0, 0.0], [1.5, 0.5], [3.0, 1.0]]),
+            np.array([[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]]),
             candidate_eligible=True,
         )
 
         self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_replaced_far")
-        cumulative = client_core.TrajectoryManager._cumulative_lengths(
-            result.active_traj
+        self.assertEqual(result.reason, "candidate_replaced")
+        self.assertAlmostEqual(result.blind_length_m, 0.7)
+        self.assertEqual(result.diffusion_point_count, 3)
+        np.testing.assert_array_equal(
+            result.active_traj[-3:],
+            [[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]],
         )
-        near = cumulative <= 1.0 + 1e-9
-        np.testing.assert_allclose(
-            result.active_traj[near],
-            previous[: np.count_nonzero(near)],
-            atol=1e-9,
+
+    def test_blind_history_is_not_capped_at_one_meter(self):
+        manager = self.make_manager(point_spacing=0.10)
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.5, 0.0], [1.0, 0.0], [1.3, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
         )
-        self.assertGreater(result.active_traj[-1, 1], 0.9)
-        self.assertAlmostEqual(result.history_length_m, 1.0)
+        result = manager.update(
+            [0.0, 0.0],
+            np.array([[1.3, 0.0], [1.7, 0.3], [2.2, 0.6]]),
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        self.assertAlmostEqual(result.blind_length_m, 1.3)
+
+    def test_complete_normalized_diffusion_candidate_is_preserved_exactly(self):
+        manager = self.make_manager()
+        manager.update(
+            [0.0, 0.0],
+            np.array([[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]),
+            candidate_eligible=True,
+        )
+        candidate = np.array(
+            [[0.8, 0.0], [0.8, 0.0], [1.11, 0.17], [1.73, 0.61]]
+        )
+        result = manager.update(
+            [0.0, 0.0],
+            candidate,
+            candidate_eligible=True,
+        )
+
+        expected = np.array([[0.8, 0.0], [1.11, 0.17], [1.73, 0.61]])
+        self.assertEqual(result.diffusion_point_count, len(expected))
+        np.testing.assert_array_equal(
+            result.active_traj[-len(expected) :],
+            expected,
+        )
+
+    def test_initial_candidate_densifies_only_chassis_blind_connector(self):
+        manager = self.make_manager(point_spacing=0.25)
+        candidate = np.array([[1.0, 0.0], [1.37, 0.23], [2.0, 0.7]])
+
+        result = manager.update(
+            [0.0, 0.0], candidate,
+            candidate_eligible=True,
+        )
+
+        self.assertEqual(result.reason, "initialized")
+        self.assertEqual(result.blind_point_count, 3)
+        self.assertEqual(result.diffusion_point_count, 3)
+        self.assertEqual(result.mpc_prediction_steps, 6)
+        np.testing.assert_array_equal(result.active_traj[-3:], candidate)
+        np.testing.assert_array_equal(result.active_traj[0], [0.0, 0.0])
 
     def test_candidate_does_not_need_continuous_overlap(self):
         manager = self.make_manager()
@@ -135,7 +183,6 @@ class TrajectoryManagerTests(unittest.TestCase):
             np.array([[0.2, 0.0], [3.0, 0.0]]),
             candidate_eligible=True,
         )
-
         result = manager.update(
             [0.0, 0.0],
             np.array([[1.0, 0.0], [1.6, 0.6], [2.5, 1.2]]),
@@ -143,55 +190,8 @@ class TrajectoryManagerTests(unittest.TestCase):
         )
 
         self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_replaced_far")
 
-    def test_old_far_points_enter_near_history_as_chassis_advances(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.4, 0.0],
-            np.array([[1.4, 0.0], [2.0, 0.5], [3.0, 0.5]]),
-            candidate_eligible=True,
-        )
-
-        np.testing.assert_array_equal(result.active_traj[0], [0.4, 0.0])
-        self.assertTrue(
-            np.any(np.isclose(result.active_traj[:, 0], 1.0, atol=0.03))
-        )
-        self.assertAlmostEqual(result.history_length_m, 1.0)
-
-    def test_candidate_points_inside_history_window_do_not_replace_history(self):
-        manager = self.make_manager()
-        previous = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        ).active_traj
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array(
-                [[0.2, 0.2], [0.6, 0.2], [1.0, 0.0], [2.0, 0.5]]
-            ),
-            candidate_eligible=True,
-        )
-
-        cumulative = client_core.TrajectoryManager._cumulative_lengths(
-            result.active_traj
-        )
-        near = cumulative <= 1.0 + 1e-9
-        np.testing.assert_allclose(
-            result.active_traj[near],
-            previous[: np.count_nonzero(near)],
-            atol=1e-9,
-        )
-
-    def test_candidate_boundary_uses_original_polyline_arc_at_sharp_corner(self):
+    def test_projection_uses_original_history_polyline_at_sharp_corner(self):
         manager = self.make_manager(join_heading_degrees=180.0)
         manager.update(
             [0.0, 0.0],
@@ -208,53 +208,17 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertTrue(result.candidate_accepted)
         self.assertAlmostEqual(
             result.join_distance_m,
-            math.sqrt(2.0) * 0.01,
+            0.0,
             places=7,
         )
 
-    def test_short_history_can_be_extended_by_far_candidate(self):
+    def test_old_path_advances_and_reanchors_at_chassis(self):
         manager = self.make_manager()
         manager.update(
             [0.0, 0.0],
-            np.array([[0.4, 0.0], [0.8, 0.0]]),
+            np.array([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]),
             candidate_eligible=True,
         )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertAlmostEqual(result.history_length_m, 0.8)
-        self.assertGreater(result.active_traj[-1, 0], 1.9)
-
-    def test_initial_candidate_starts_at_chassis_and_fills_near_field(self):
-        manager = self.make_manager()
-
-        result = manager.update(
-            np.array([2.0, 3.0]),
-            np.array([[3.0, 3.0], [4.0, 3.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.reason, "initialized")
-        np.testing.assert_array_equal(result.active_traj[0], [2.0, 3.0])
-        self.assertEqual(result.history_length_m, 0.0)
-        self.assertEqual(result.history_point_count, 0)
-        distances = np.linalg.norm(np.diff(result.active_traj, axis=0), axis=1)
-        np.testing.assert_allclose(distances, 0.05, atol=1e-9)
-
-    def test_advance_prunes_traversed_history_and_reanchors_at_chassis(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
         result = manager.update([0.35, 0.02])
 
         np.testing.assert_array_equal(result.active_traj[0], [0.35, 0.02])
@@ -312,7 +276,7 @@ class TrajectoryManagerTests(unittest.TestCase):
         self.assertFalse(result.candidate_accepted)
         self.assertEqual(result.reason, "join_heading")
 
-    def test_short_join_is_snapped_without_exceeding_heading_limit(self):
+    def test_short_join_uses_path_headings_without_altering_candidate(self):
         manager = self.make_manager(join_heading_degrees=60.0)
         manager.update(
             [0.0, 0.0],
@@ -327,42 +291,14 @@ class TrajectoryManagerTests(unittest.TestCase):
         )
 
         self.assertTrue(result.candidate_accepted)
-        segment_headings = np.arctan2(
-            np.diff(result.active_traj[:, 1]),
-            np.diff(result.active_traj[:, 0]),
+        np.testing.assert_array_equal(
+            result.active_traj[-2:],
+            [[1.0, 0.05], [2.0, 0.05]],
         )
-        heading_changes = np.abs(
-            np.arctan2(
-                np.sin(np.diff(segment_headings)),
-                np.cos(np.diff(segment_headings)),
-            )
-        )
-        self.assertLessEqual(
-            float(np.max(heading_changes)),
-            math.radians(60.0),
-        )
-
-    def test_collapsed_far_segment_retains_history_without_raising(self):
-        manager = self.make_manager()
-        previous = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        ).active_traj
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.99, 0.01], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_too_short")
-        np.testing.assert_array_equal(result.active_traj, previous)
 
     def test_low_critic_candidate_retains_history_until_exhausted(self):
         manager = self.make_manager(min_remaining=0.20)
-        manager.update(
+        initialized = manager.update(
             [0.0, 0.0],
             np.array([[0.5, 0.0], [1.0, 0.0]]),
             candidate_eligible=True,
@@ -377,8 +313,13 @@ class TrajectoryManagerTests(unittest.TestCase):
 
         self.assertEqual(retained.reason, "candidate_low_critic")
         self.assertIsNotNone(retained.active_traj)
+        self.assertEqual(
+            retained.mpc_prediction_steps,
+            initialized.mpc_prediction_steps,
+        )
         self.assertIsNone(exhausted.active_traj)
         self.assertEqual(exhausted.reason, "history_exhausted")
+        self.assertEqual(exhausted.mpc_prediction_steps, 0)
 
     def test_history_exhausts_when_chassis_has_overshot_terminal_point(self):
         manager = self.make_manager(min_remaining=0.20)
@@ -408,7 +349,7 @@ class TrajectoryManagerTests(unittest.TestCase):
 
     def test_invalid_candidate_retains_history(self):
         manager = self.make_manager()
-        manager.update(
+        initialized = manager.update(
             [0.0, 0.0],
             np.array([[0.5, 0.0], [1.0, 0.0]]),
             candidate_eligible=True,
@@ -422,6 +363,10 @@ class TrajectoryManagerTests(unittest.TestCase):
 
         self.assertEqual(result.reason, "candidate_invalid")
         self.assertIsNotNone(result.active_traj)
+        self.assertEqual(
+            result.diffusion_point_count,
+            initialized.diffusion_point_count,
+        )
 
     def test_result_does_not_allow_mutating_manager_state(self):
         manager = self.make_manager()
@@ -437,27 +382,49 @@ class TrajectoryManagerTests(unittest.TestCase):
 
         self.assertLess(second.active_traj[0, 0], 1.0)
 
-    def test_update_reports_near_and_far_lengths(self):
-        manager = self.make_manager()
-        manager.update(
+    def test_constructor_parameters_must_be_positive_and_finite(self):
+        for parameter in (
+            "point_spacing",
+            "join_distance",
+            "join_heading_degrees",
+            "min_remaining",
+        ):
+            for value in (0.0, -1.0, math.nan, math.inf):
+                with self.subTest(parameter=parameter, value=value):
+                    with self.assertRaises(ValueError):
+                        self.make_manager(**{parameter: value})
+
+    def test_update_reports_dynamic_lengths_counts_and_timing(self):
+        manager = self.make_manager(point_spacing=0.20)
+        result = manager.update(
             [0.0, 0.0],
             np.array([[1.0, 0.0], [3.0, 0.0]]),
             candidate_eligible=True,
         )
 
-        result = manager.update([0.0, 0.0])
-
-        self.assertAlmostEqual(result.history_length_m, 1.0)
-        self.assertEqual(result.history_point_count, 21)
-        self.assertAlmostEqual(result.far_length_m, 2.0)
+        self.assertAlmostEqual(result.blind_length_m, 1.0)
+        self.assertEqual(result.blind_point_count, 4)
+        self.assertAlmostEqual(result.diffusion_length_m, 2.0)
+        self.assertEqual(result.diffusion_point_count, 2)
+        self.assertEqual(result.mpc_prediction_steps, 6)
         self.assertAlmostEqual(result.remaining_length_m, 3.0)
         self.assertGreaterEqual(result.manager_update_ms, 0.0)
 
-    def test_history_distance_must_be_positive_and_finite(self):
-        for value in (0.0, -1.0, math.nan, math.inf):
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    self.make_manager(history_distance=value)
+    def test_candidate_must_have_two_distinct_finite_points(self):
+        manager = self.make_manager()
+        for candidate in (
+            np.array([[1.0, 0.0]]),
+            np.array([[1.0, 0.0], [1.0, 0.0]]),
+            np.array([[math.nan, 0.0], [2.0, 0.0]]),
+        ):
+            with self.subTest(candidate=candidate):
+                result = manager.update(
+                    [0.0, 0.0],
+                    candidate,
+                    candidate_eligible=True,
+                )
+                self.assertFalse(result.candidate_accepted)
+                self.assertEqual(result.reason, "candidate_invalid")
 
     def test_seventy_point_update_completes_within_realtime_budget(self):
         manager = self.make_manager()

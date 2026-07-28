@@ -18,9 +18,11 @@ class TrajectoryUpdate:
     candidate_accepted: bool
     reason: str
     join_distance_m: Optional[float]
-    history_length_m: float
-    history_point_count: int
-    far_length_m: float
+    blind_length_m: float
+    blind_point_count: int
+    diffusion_length_m: float
+    diffusion_point_count: int
+    mpc_prediction_steps: int
     remaining_length_m: float
     manager_update_ms: float
 
@@ -35,14 +37,12 @@ class TrajectoryManager:
         join_distance: float = 0.50,
         join_heading_degrees: float = 60.0,
         min_remaining: float = 0.20,
-        history_distance: float = 1.0,
     ):
         values = {
             "point_spacing": point_spacing,
             "join_distance": join_distance,
             "join_heading_degrees": join_heading_degrees,
             "min_remaining": min_remaining,
-            "history_distance": history_distance,
         }
         for name, value in values.items():
             if not np.isfinite(value) or value <= 0.0:
@@ -51,8 +51,11 @@ class TrajectoryManager:
         self.join_distance = float(join_distance)
         self.join_heading = math.radians(float(join_heading_degrees))
         self.min_remaining = float(min_remaining)
-        self.history_distance = float(history_distance)
         self._active_traj = None
+        self._blind_length_m = 0.0
+        self._blind_point_count = 0
+        self._diffusion_length_m = 0.0
+        self._diffusion_point_count = 0
 
     def update(
         self,
@@ -69,11 +72,6 @@ class TrajectoryManager:
         active = history
         accepted = False
         join_distance_m = None
-        history_length_m = (
-            0.0
-            if history is None
-            else min(self.history_distance, self._polyline_length(history))
-        )
         reason = "history_retained" if history is not None else "no_history"
 
         candidate = None
@@ -88,116 +86,107 @@ class TrajectoryManager:
 
         if candidate is not None:
             if history is None:
-                initialized = self._resample_polyline(
-                    self._normalize_polyline(np.vstack((chassis, candidate)))
+                blind_path = self._densify_preserving_vertices(
+                    self._normalize_polyline(
+                        np.vstack((chassis, candidate[0]))
+                    )
+                )
+                blind_guides = blind_path[1:-1]
+                initialized = np.vstack(
+                    (chassis, blind_guides, candidate)
                 )
                 if self._polyline_length(initialized) >= self.min_remaining:
                     active = initialized
                     accepted = True
                     reason = "initialized"
+                    self._set_candidate_metadata(
+                        blind_path,
+                        blind_guides,
+                        candidate,
+                    )
                 else:
                     reason = "candidate_too_short"
             else:
-                history_prefix = self._prefix_through_arc(
+                history_cumulative = self._cumulative_lengths(history)
+                (
+                    join_distance_m,
+                    segment_index,
+                    join_point,
+                    _,
+                ) = self._projection_with_arc(
                     history,
-                    history_length_m,
+                    history_cumulative,
+                    candidate[0],
                 )
-                candidate_from_chassis = self._normalize_polyline(
-                    np.vstack((chassis, candidate))
+                history_heading = (
+                    history[segment_index + 1] - history[segment_index]
                 )
-                candidate_length = self._polyline_length(
-                    candidate_from_chassis
-                )
-                if candidate_length <= self.history_distance:
-                    reason = "candidate_too_short"
+                candidate_heading = candidate[1] - candidate[0]
+                if join_distance_m > self.join_distance:
+                    reason = "join_distance"
                 else:
-                    candidate_far = self._suffix_from_arc(
-                        candidate_from_chassis,
-                        self.history_distance,
-                    )
-                    join_distance_m = float(
-                        np.linalg.norm(candidate_far[0] - history_prefix[-1])
-                    )
-                    if join_distance_m > self.join_distance:
-                        reason = "join_distance"
+                    if join_distance_m <= self.point_spacing:
+                        heading_deltas = [
+                            self._heading_delta(
+                                history_heading,
+                                candidate_heading,
+                            )
+                        ]
                     else:
-                        if join_distance_m <= self.point_spacing:
-                            distinct_far_indices = np.flatnonzero(
-                                np.linalg.norm(
-                                    candidate_far - history_prefix[-1],
-                                    axis=1,
-                                )
-                                > self.point_spacing + 1e-9
-                            )
-                            if len(distinct_far_indices) == 0:
-                                candidate_far = None
-                                reason = "candidate_too_short"
-                            else:
-                                candidate_far = self._normalize_polyline(
-                                    np.vstack(
-                                        (
-                                            history_prefix[-1],
-                                            candidate_far[
-                                                distinct_far_indices[0] :
-                                            ],
-                                        )
-                                    )
-                                )
-                                heading_deltas = [
-                                    self._heading_delta(
-                                        history_prefix[-1]
-                                        - history_prefix[-2],
-                                        candidate_far[1] - candidate_far[0],
-                                    )
-                                ]
-                        else:
-                            connector_heading = (
-                                candidate_far[0] - history_prefix[-1]
-                            )
-                            heading_deltas = [
-                                self._heading_delta(
-                                    history_prefix[-1] - history_prefix[-2],
-                                    connector_heading,
-                                ),
-                                self._heading_delta(
-                                    connector_heading,
-                                    candidate_far[1] - candidate_far[0],
-                                ),
-                            ]
-                        if candidate_far is not None:
-                            if max(heading_deltas) > self.join_heading:
-                                reason = "join_heading"
-                            else:
-                                combined = self._normalize_polyline(
-                                    np.vstack((history_prefix, candidate_far))
-                                )
-                                active = self._resample_polyline(combined)
-                                accepted = True
-                                reason = "candidate_replaced_far"
+                        connector_heading = candidate[0] - join_point
+                        heading_deltas = [
+                            self._heading_delta(
+                                history_heading,
+                                connector_heading,
+                            ),
+                            self._heading_delta(
+                                connector_heading,
+                                candidate_heading,
+                            ),
+                        ]
+                    if max(heading_deltas) > self.join_heading:
+                        reason = "join_heading"
+                    else:
+                        prefix_points = list(history[: segment_index + 1])
+                        if not np.allclose(
+                            prefix_points[-1],
+                            join_point,
+                            rtol=0.0,
+                            atol=np.finfo(np.float64).eps,
+                        ):
+                            prefix_points.append(join_point)
+                        if not np.allclose(
+                            prefix_points[-1],
+                            candidate[0],
+                            rtol=0.0,
+                            atol=np.finfo(np.float64).eps,
+                        ):
+                            prefix_points.append(candidate[0])
+                        blind_path = self._densify_preserving_vertices(
+                            np.asarray(prefix_points)
+                        )
+                        blind_guides = blind_path[1:-1]
+                        active = np.vstack(
+                            (chassis, blind_guides, candidate)
+                        )
+                        accepted = True
+                        reason = "candidate_replaced"
+                        self._set_candidate_metadata(
+                            blind_path,
+                            blind_guides,
+                            candidate,
+                        )
 
         if active is None and had_history and candidate_world_xy is None:
             reason = "history_exhausted"
         self._active_traj = None if active is None else active.copy()
+        if self._active_traj is None:
+            self._clear_candidate_metadata()
         remaining = (
             0.0
             if self._active_traj is None
             else self._polyline_length(self._active_traj)
         )
-        if self._active_traj is None:
-            history_length_m = 0.0
-            history_point_count = 0
-        elif history is None:
-            history_length_m = 0.0
-            history_point_count = 0
-        else:
-            history_length_m = min(history_length_m, remaining)
-            active_cumulative = self._cumulative_lengths(self._active_traj)
-            history_point_count = int(
-                np.count_nonzero(
-                    active_cumulative <= history_length_m + 1e-9
-                )
-            )
-        far_length_m = max(0.0, remaining - history_length_m)
         result_traj = (
             None if self._active_traj is None else self._active_traj.copy()
         )
@@ -208,9 +197,13 @@ class TrajectoryManager:
             candidate_accepted=accepted,
             reason=reason,
             join_distance_m=join_distance_m,
-            history_length_m=history_length_m,
-            history_point_count=history_point_count,
-            far_length_m=far_length_m,
+            blind_length_m=self._blind_length_m,
+            blind_point_count=self._blind_point_count,
+            diffusion_length_m=self._diffusion_length_m,
+            diffusion_point_count=self._diffusion_point_count,
+            mpc_prediction_steps=(
+                self._blind_point_count + self._diffusion_point_count
+            ),
             remaining_length_m=remaining,
             manager_update_ms=(time.perf_counter() - update_started) * 1000.0,
         )
@@ -262,6 +255,38 @@ class TrajectoryManager:
                 np.interp(targets, cumulative, points[:, 1]),
             )
         )
+
+    def _densify_preserving_vertices(self, points: np.ndarray) -> np.ndarray:
+        points = self._normalize_polyline(points)
+        dense = [points[0]]
+        for start, end in zip(points[:-1], points[1:]):
+            segment = end - start
+            length = float(np.linalg.norm(segment))
+            for distance in np.arange(
+                self.point_spacing,
+                length,
+                self.point_spacing,
+            ):
+                dense.append(start + segment * (distance / length))
+            dense.append(end)
+        return self._normalize_polyline(np.asarray(dense))
+
+    def _set_candidate_metadata(
+        self,
+        blind_path: np.ndarray,
+        blind_guides: np.ndarray,
+        candidate: np.ndarray,
+    ):
+        self._blind_length_m = self._polyline_length(blind_path)
+        self._blind_point_count = len(blind_guides)
+        self._diffusion_length_m = self._polyline_length(candidate)
+        self._diffusion_point_count = len(candidate)
+
+    def _clear_candidate_metadata(self):
+        self._blind_length_m = 0.0
+        self._blind_point_count = 0
+        self._diffusion_length_m = 0.0
+        self._diffusion_point_count = 0
 
     @staticmethod
     def _point_at_arc(
@@ -369,9 +394,8 @@ class TrajectoryManager:
             )
         except ValueError:
             return None, True
-        advanced = self._resample_polyline(remainder)
-        advanced[0] = chassis
-        return advanced, True
+        remainder[0] = chassis
+        return remainder, True
 
     @staticmethod
     def _heading_delta(first: np.ndarray, second: np.ndarray) -> float:
