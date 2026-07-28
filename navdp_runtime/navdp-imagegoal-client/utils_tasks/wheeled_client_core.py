@@ -212,9 +212,18 @@ class TrajectoryManager:
                     if max(heading_deltas) > self.join_heading:
                         reason = "join_heading"
                     else:
+                        proposed_spacing = self._candidate_spacing(
+                            candidate,
+                            self.point_spacing,
+                        )
                         history_prefix = self._prefix_through_arc(
                             history,
                             join_arc,
+                        )
+                        history_prefix = self._prune_prefix_near_candidate(
+                            history_prefix,
+                            candidate[0],
+                            proposed_spacing,
                         )
                         proposed_centerline = self._normalize_polyline(
                             np.vstack((history_prefix, candidate))
@@ -226,10 +235,6 @@ class TrajectoryManager:
                                     candidate[0] - history_prefix[-1]
                                 )
                             )
-                        )
-                        proposed_spacing = self._candidate_spacing(
-                            candidate,
-                            self.point_spacing,
                         )
                         proposed, blind_guides = self._active_from_state(
                             chassis,
@@ -398,6 +403,33 @@ class TrajectoryManager:
         )
 
     @staticmethod
+    def _prune_prefix_near_candidate(
+        prefix: np.ndarray,
+        candidate_first: np.ndarray,
+        spacing: float,
+    ) -> np.ndarray:
+        keep_count = len(prefix)
+        while (
+            keep_count > 1
+            and np.linalg.norm(
+                candidate_first - prefix[keep_count - 1]
+            )
+            < spacing - 1e-9
+        ):
+            if keep_count == 2:
+                initial_tangent = prefix[1] - prefix[0]
+                if (
+                    np.dot(
+                        candidate_first - prefix[0],
+                        initial_tangent,
+                    )
+                    <= 0.0
+                ):
+                    break
+            keep_count -= 1
+        return prefix[:keep_count].copy()
+
+    @staticmethod
     def _assemble_active_trajectory(
         chassis: np.ndarray,
         blind_guides: np.ndarray,
@@ -423,6 +455,12 @@ class TrajectoryManager:
             diffusion_start_arc,
             diffusion_spacing,
         )
+        if (
+            len(blind_arcs) > 0
+            and diffusion_start_arc - blind_arcs[-1]
+            < 0.5 * diffusion_spacing
+        ):
+            blind_arcs = blind_arcs[:-1]
         blind_guides = self._sample_at_arcs(centerline, blind_arcs)
         tangent = centerline[1] - centerline[0]
         blind_guides = np.asarray(

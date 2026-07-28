@@ -671,6 +671,51 @@ class TrajectoryManagerTests(unittest.TestCase):
             result.active_traj[-2:],
             [[1.0, 0.05], [2.0, 0.05]],
         )
+        self.assertEqual(result.blind_point_count, 0)
+        np.testing.assert_array_equal(
+            result.active_traj,
+            [[0.0, 0.0], [1.0, 0.05], [2.0, 0.05]],
+        )
+
+    def test_candidate_join_prunes_history_points_within_current_spacing(self):
+        manager = self.make_manager(join_heading_degrees=60.0)
+        manager.update(
+            [0.0, 0.0],
+            np.array(
+                [
+                    [0.40, 0.0],
+                    [0.80, 0.0],
+                    [0.90, 0.02],
+                    [1.00, 0.0],
+                    [1.50, 0.0],
+                ]
+            ),
+            candidate_eligible=True,
+        )
+        candidate = np.array(
+            [[1.00, 0.05], [1.40, 0.05], [1.80, 0.05]]
+        )
+
+        result = manager.update(
+            [0.0, 0.0],
+            candidate,
+            candidate_eligible=True,
+        )
+
+        self.assertTrue(result.candidate_accepted)
+        np.testing.assert_array_equal(result.active_traj[-3:], candidate)
+        candidate_index = next(
+            index
+            for index, point in enumerate(manager._history_centerline)
+            if np.array_equal(point, candidate[0])
+        )
+        previous_history_point = manager._history_centerline[
+            candidate_index - 1
+        ]
+        self.assertGreaterEqual(
+            np.linalg.norm(candidate[0] - previous_history_point),
+            result.diffusion_spacing_m - 1e-9,
+        )
 
     def test_low_critic_candidate_retains_history_until_exhausted(self):
         manager = self.make_manager(min_remaining=0.20)
