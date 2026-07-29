@@ -35,6 +35,23 @@ class GeometryTests(unittest.TestCase):
         transform[:3, 3] = [0.0, 0.0, height]
         return transform
 
+    def test_official_camera_transform_is_level_at_fixed_height(self):
+        self.assertEqual(client_core.NAVDP_OFFICIAL_CAMERA_HEIGHT_M, 0.2)
+
+        transform = client_core.navdp_official_base_from_camera()
+
+        np.testing.assert_array_equal(
+            transform,
+            np.array(
+                [
+                    [0.0, 0.0, 1.0, 0.0],
+                    [-1.0, 0.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0, 0.2],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+        )
+
     def test_navdp_virtual_pixels_match_official_height_formula(self):
         intrinsic = np.array(
             [[100.0, 0.0, 2.0], [0.0, 120.0, 2.0], [0.0, 0.0, 1.0]]

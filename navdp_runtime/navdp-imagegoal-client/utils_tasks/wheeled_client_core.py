@@ -408,6 +408,26 @@ def transform_matrix_from_translation_quaternion(
     return transform
 
 
+NAVDP_OFFICIAL_CAMERA_HEIGHT_M = 0.2
+
+
+def navdp_official_base_from_camera() -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    transform[:3, 3] = np.array(
+        [0.0, 0.0, NAVDP_OFFICIAL_CAMERA_HEIGHT_M],
+        dtype=np.float64,
+    )
+    return transform
+
+
 def navdp_virtual_pixels(
     local_xy: np.ndarray,
     intrinsic: np.ndarray,
