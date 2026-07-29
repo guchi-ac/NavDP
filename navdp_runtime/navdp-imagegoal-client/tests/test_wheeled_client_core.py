@@ -972,7 +972,7 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("self._invalidate_tracking_state()", source)
         self.assertNotIn("trajectory_manager.update", source)
 
-    def test_client_exposes_virtual_camera_height_default(self):
+    def test_client_fixes_official_camera_height_without_runtime_override(self):
         source = self.client_source()
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -988,12 +988,13 @@ class RosClientSourceTests(unittest.TestCase):
             text=True,
         )
 
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertNotIn("--virtual-camera-height", help_result.stdout)
+        self.assertNotIn("args.virtual_camera_height", source)
         self.assertIn(
-            'parser.add_argument("--virtual-camera-height", type=float, default=0.2)',
+            '"virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M',
             source,
         )
-        self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("--virtual-camera-height", help_result.stdout)
 
     def test_client_logs_raw_and_reprojected_plan_geometry(self):
         source = self.client_source()
@@ -1002,7 +1003,7 @@ class RosClientSourceTests(unittest.TestCase):
             '"raw_selected_world_xy": raw_selected_world_xy',
             '"reprojected_base_xy": reprojected_base_xy',
             '"reprojected_world_xy": reprojected_world_xy',
-            '"virtual_camera_height_m": self.args.virtual_camera_height',
+            '"virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M',
             '"reprojection_status":',
             '"reprojection_reason": reprojection_error',
         ):
@@ -1361,8 +1362,10 @@ class RosClientSourceTests(unittest.TestCase):
             "`static_transform_publisher`",
             "/home/dev/navdp_deployment/navdp_runtime/navdp-imagegoal-client",
             "--goal-image goal_far.jpg",
-            "--virtual-camera-height 0.2",
-            "虚拟相机高度",
+            "/cam_head/d435/color/camera_info",
+            "`Z=-0.2 m`",
+            "官方控制高度固定为 `0.2 m`",
+            "真机 D435 optical TF 仍用于 RGB-D BEV",
             "黄色",
             "青色",
         ):
@@ -1374,6 +1377,8 @@ class RosClientSourceTests(unittest.TestCase):
             "ros2 action send_goal /Torso/torso_action_service",
             "torso_mask: [false, false]",
             "/home/dev/navdp_runtime/navdp-imagegoal-client",
+            "--virtual-camera-height",
+            "虚拟相机高度可显式配置",
         ):
             self.assertNotIn(removed, source)
 

@@ -118,13 +118,6 @@ class MpcVisualizationSnapshot:
 class NavdpImageGoalClient(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__("navdp_imagegoal_client")
-        if (
-            not np.isfinite(args.virtual_camera_height)
-            or args.virtual_camera_height <= 0.0
-        ):
-            raise ValueError(
-                "--virtual-camera-height must be positive and finite"
-            )
         goal_bgr = cv2.imread(args.goal_image, cv2.IMREAD_COLOR)
         if goal_bgr is None:
             raise FileNotFoundError(f"cannot read goal image: {args.goal_image}")
@@ -1300,7 +1293,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-v", type=float, default=0.1)
     parser.add_argument("--max-w", type=float, default=0.50)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
-    parser.add_argument("--virtual-camera-height", type=float, default=0.2)
     parser.add_argument("--arrival-distance", type=float, default=0.2)
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)

@@ -71,14 +71,16 @@ RGB-D 几何验证器第一帧进入
 保持一致：每轮有效的 NavDP selected diffusion 都直接创建一个新的 MPC，
 不保存历史引导点、不补“底盘到首点”的盲区点，也不对引导点重新采样。
 
-NavDP 原始 selected diffusion 先按官方虚拟相机高度 `0.2 m` 投影到像素，
-再通过当前 D435 optical TF 与 `base_link` 地面 `z=0` 求交。求交后的黄色
-`active_traj` 保留全部重投影 diffusion 点并直接送给 MPC；青色轨迹保留未经
-重投影的原始 selected diffusion，仅用于对比。虚拟相机高度可显式配置：
+NavDP 原始 selected diffusion 使用真机
+`/cam_head/d435/color/camera_info` 发布的彩色相机内参，并按官方 RGB
+记录方式固定采用水平相机和相机坐标地面 `Z=-0.2 m`。控制轨迹不使用真机
+D435 的安装高度、平移、俯仰、横滚或偏航；黄色 `active_traj` 保留全部
+官方几何转换后的 diffusion 点并直接送给 MPC。青色 selected 使用相同的
+官方平面方向，仅用于对比。
 
-```text
---virtual-camera-height 0.2
-```
+真机 D435 optical TF 仍用于 RGB-D BEV 点云反投影和 TF 诊断，不参与
+selected 到黄色 guide 的控制几何。官方控制高度固定为 `0.2 m`，没有运行时
+覆盖参数。
 
 如果射线与地面平行、交点位于相机后方、交点不在底盘前方或轨迹前向次序
 非法，或者 critic 低于阈值，本轮规划会清空旧 MPC 和旧执行轨迹并停车，
@@ -252,9 +254,10 @@ PYTHONPATH=.. python3 -m unittest \
 ```
 
 `plan` 行记录 `selected_local_xy`、原始 `raw_selected_world_xy`、重投影后的
-`reprojected_base_xy` / `reprojected_world_xy`、虚拟相机高度、重投影状态与
-拒绝原因，并同时记录实际 `active_traj`、`mpc_horizon`、规划时的
-odom/相机位姿、critic 和规划耗时；
+`reprojected_base_xy` / `reprojected_world_xy`、固定官方相机高度 `0.2 m`、
+重投影状态与拒绝原因，并同时记录实际 `active_traj`、`mpc_horizon`、规划时
+的 odom/相机位姿、critic 和规划耗时；其中 `camera_pose` 仅用于真机 TF 与
+BEV 诊断，不影响控制轨迹投影。
 `control` 行按控制周期记录 odom 位姿与实测速度、发送的 `v/w`、MPC 参考状态、
 预测状态、求解耗时及 frame/odom/plan 数据年龄。其中
 `desired_velocity=[linear_x, angular_z]` 是期望/发布速度，
