@@ -57,12 +57,14 @@ from utils_tasks.rgb_bev_visualizer import (
 from utils_tasks.rgbd_goal_verifier import RgbdGoalVerifier, VerifierConfig
 from utils_tasks.visualization_utils import VisualizationManager
 from utils_tasks.wheeled_client_core import (
+    NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
     JsonlWriter,
     PostureActionRunner,
     SelectedDiffusionInstallState,
     camera_pose_from_transform,
     control_stop_reason,
     finalize_mp4,
+    navdp_official_base_from_camera,
     normalize_tracking_trajectory,
     put_latest,
     reproject_navdp_to_ground_base,
@@ -626,20 +628,18 @@ class NavdpImageGoalClient(Node):
                 local_xy = raw_local_xy
                 if len(local_xy) < 2 or not np.isfinite(local_xy).all():
                     raise ValueError(f"invalid NavDP trajectory shape: {local_xy.shape}")
+                official_base_from_camera = navdp_official_base_from_camera()
                 raw_selected_world_xy = trajectory_to_world(
                     raw_local_xy,
                     snapshot.odom_xy_yaw,
-                    camera_x=snapshot.camera_xy_yaw[0],
-                    camera_y=snapshot.camera_xy_yaw[1],
-                    camera_yaw=snapshot.camera_xy_yaw[2],
                 )
                 try:
                     reprojected_base_xy = reproject_navdp_to_ground_base(
-                        raw_local_xy,
-                        snapshot.intrinsic,
-                        snapshot.rgb_bgr.shape[0],
-                        snapshot.base_from_camera,
-                        self.args.virtual_camera_height,
+                        local_xy=raw_local_xy,
+                        intrinsic=snapshot.intrinsic,
+                        image_height=snapshot.rgb_bgr.shape[0],
+                        base_from_camera=official_base_from_camera,
+                        virtual_camera_height=NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
                     )
                     reprojected_world_xy = trajectory_to_world(
                         reprojected_base_xy,
@@ -720,7 +720,7 @@ class NavdpImageGoalClient(Node):
                         "raw_selected_world_xy": raw_selected_world_xy,
                         "reprojected_base_xy": reprojected_base_xy,
                         "reprojected_world_xy": reprojected_world_xy,
-                        "virtual_camera_height_m": self.args.virtual_camera_height,
+                        "virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
                         "reprojection_status": reprojection_status,
                         "reprojection_reason": reprojection_error,
                         "active_traj": None,
@@ -793,7 +793,7 @@ class NavdpImageGoalClient(Node):
                         "raw_selected_world_xy": raw_selected_world_xy,
                         "reprojected_base_xy": reprojected_base_xy,
                         "reprojected_world_xy": reprojected_world_xy,
-                        "virtual_camera_height_m": self.args.virtual_camera_height,
+                        "virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
                         "reprojection_status": reprojection_status,
                         "reprojection_reason": reprojection_error,
                         "active_traj": active_traj,

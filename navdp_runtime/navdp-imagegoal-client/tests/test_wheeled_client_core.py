@@ -873,6 +873,73 @@ class RosClientSourceTests(unittest.TestCase):
         )
         return client_path.read_text(encoding="utf-8")
 
+    @classmethod
+    def planning_source(cls):
+        source = cls.client_source()
+        tree = ast.parse(source)
+        planning = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_planning_loop"
+        )
+        return ast.get_source_segment(source, planning)
+
+    def test_control_projection_uses_official_extrinsic_and_live_intrinsic(self):
+        planning_source = self.planning_source()
+
+        self.assertIn(
+            "official_base_from_camera = navdp_official_base_from_camera()",
+            planning_source,
+        )
+        self.assertIn(
+            "algo = navigator_reset(\n"
+            "                        snapshot.intrinsic,",
+            planning_source,
+        )
+        self.assertIn("intrinsic=snapshot.intrinsic", planning_source)
+        self.assertIn(
+            "base_from_camera=official_base_from_camera",
+            planning_source,
+        )
+        self.assertIn(
+            "virtual_camera_height=NAVDP_OFFICIAL_CAMERA_HEIGHT_M",
+            planning_source,
+        )
+        self.assertNotIn("snapshot.base_from_camera", planning_source)
+
+    def test_selected_and_guide_world_paths_ignore_live_camera_planar_pose(self):
+        planning_source = self.planning_source()
+
+        self.assertIn(
+            "raw_selected_world_xy = trajectory_to_world(\n"
+            "                    raw_local_xy,\n"
+            "                    snapshot.odom_xy_yaw,\n"
+            "                )",
+            planning_source,
+        )
+        self.assertIn(
+            "reprojected_world_xy = trajectory_to_world(\n"
+            "                        reprojected_base_xy,\n"
+            "                        snapshot.odom_xy_yaw,\n"
+            "                    )",
+            planning_source,
+        )
+
+    def test_live_camera_transform_remains_available_to_rgbd_bev(self):
+        source = self.client_source()
+        tree = ast.parse(source)
+        render_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_mpc_bev"
+        )
+        render_source = ast.get_source_segment(source, render_method)
+
+        self.assertIn(
+            "base_from_camera=snapshot.base_from_camera",
+            render_source,
+        )
+
     def test_client_tracks_reprojected_path_directly_but_snapshots_raw_selected(self):
         source = self.client_source()
 
