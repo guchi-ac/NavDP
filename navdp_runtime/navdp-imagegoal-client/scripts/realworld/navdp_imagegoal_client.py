@@ -730,7 +730,7 @@ class NavdpImageGoalClient(Node):
                         if self.mpc is None:
                             next_mpc = Mpc_controller(
                                 active_traj,
-                                desired_v=0.5,
+                                desired_v=self.args.max_v,
                                 v_max=self.args.max_v,
                                 w_max=self.args.max_w,
                             )
@@ -1311,7 +1311,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync-slop", type=float, default=0.1)
     parser.add_argument("--plan-period", type=float, default=0.3)
     parser.add_argument("--max-v", type=float, default=0.15)
-    parser.add_argument("--max-w", type=float, default=0.30)
+    parser.add_argument("--max-w", type=float, default=0.50)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
     parser.add_argument("--arrival-distance", type=float, default=0.5)
     parser.add_argument("--arrival-consecutive", type=int, default=3)

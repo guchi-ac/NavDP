@@ -3,10 +3,61 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.realworld.controllers import Mpc_controller
+from scripts.realworld.controllers import (
+    Mpc_controller,
+    reference_poses_from_xy,
+)
 
 
 class UpstreamNavdpMpcTests(unittest.TestCase):
+    def test_reference_pose_yaw_follows_guide_tangent(self):
+        poses = reference_poses_from_xy(
+            np.array([[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]]),
+            current_yaw=0.0,
+        )
+        np.testing.assert_allclose(poses[:, 2], np.pi / 2.0)
+
+    def test_reference_pose_yaw_uses_nearest_equivalent_at_wrap(self):
+        angle = np.deg2rad(-179.0)
+        points = np.array(
+            [[0.0, 0.0], [np.cos(angle), np.sin(angle)]]
+        )
+        poses = reference_poses_from_xy(
+            points,
+            current_yaw=np.deg2rad(179.0),
+        )
+        np.testing.assert_allclose(
+            poses[:, 2],
+            np.deg2rad(181.0),
+            atol=1e-12,
+        )
+
+    def test_reference_pose_yaw_handles_repeated_points(self):
+        poses = reference_poses_from_xy(
+            np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 0.0]]),
+            current_yaw=0.3,
+        )
+        np.testing.assert_allclose(poses[:, 2], 0.0)
+
+    def test_reference_pose_yaw_reuses_nearest_valid_interior_tangent(self):
+        poses = reference_poses_from_xy(
+            np.array(
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 1.0],
+                ]
+            ),
+            current_yaw=0.0,
+        )
+        np.testing.assert_allclose(
+            poses[:, 2],
+            [0.0, 0.0, np.pi / 2.0, np.pi / 2.0, np.pi / 2.0],
+            atol=1e-12,
+        )
+
     def test_uses_upstream_default_horizon_and_reference_gap(self):
         controller = Mpc_controller(
             np.array([[0.0, 0.0], [1.0, 0.0]])
@@ -73,7 +124,55 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
         self.assertIs(controller.last_opt_u_controls, previous_controls)
         self.assertIs(controller.last_opt_x_states, previous_states)
 
-    def test_source_matches_upstream_cost_and_zero_yaw_reference(self):
+    def test_straight_guide_keeps_angular_velocity_small(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [1.0, 0.0]]),
+            desired_v=0.15,
+            v_max=0.15,
+            w_max=0.5,
+        )
+        controls, _ = controller.solve(np.array([0.0, 0.0, 0.0]))
+        self.assertGreater(controls[0, 0], 0.05)
+        self.assertLess(abs(controls[0, 1]), 0.02)
+
+    def test_right_angle_guide_trades_linear_speed_for_angular_speed(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [0.0, 1.0]]),
+            desired_v=0.15,
+            v_max=0.15,
+            w_max=0.5,
+        )
+        controls, _ = controller.solve(np.array([0.0, 0.0, 0.0]))
+        self.assertLess(controls[0, 0], 0.03)
+        self.assertGreater(controls[0, 1], 0.2)
+
+    def test_wrap_boundary_solver_turns_shortest_way_in_both_directions(self):
+        for current_degrees, tangent_degrees, expected_sign in (
+            (179.0, -179.0, 1.0),
+            (-179.0, 179.0, -1.0),
+        ):
+            with self.subTest(
+                current_degrees=current_degrees,
+                tangent_degrees=tangent_degrees,
+            ):
+                tangent = np.deg2rad(tangent_degrees)
+                controller = Mpc_controller(
+                    np.array(
+                        [
+                            [0.0, 0.0],
+                            [np.cos(tangent), np.sin(tangent)],
+                        ]
+                    ),
+                    desired_v=0.15,
+                    v_max=0.15,
+                    w_max=0.5,
+                )
+                controls, _ = controller.solve(
+                    np.array([0.0, 0.0, np.deg2rad(current_degrees)])
+                )
+                self.assertGreater(expected_sign * controls[0, 1], 0.05)
+
+    def test_source_uses_guide_yaw_reference_and_tuned_cost(self):
         source = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -81,10 +180,13 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
             / "controllers.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("Q = np.diag([10.0, 10.0, 0.0])", source)
+        self.assertIn("Q = np.diag([10.0, 10.0, 5.0])", source)
         self.assertIn("R = np.diag([0.02, 0.15])", source)
-        self.assertIn("np.zeros((ref_traj.shape[0], 1))", source)
-        self.assertNotIn("reference_poses_from_xy", source)
+        self.assertIn(
+            "reference_poses_from_xy(ref_traj, x0[2])",
+            source,
+        )
+        self.assertNotIn("np.zeros((ref_traj.shape[0], 1))", source)
         self.assertNotIn("blind_steps", source)
 
 
