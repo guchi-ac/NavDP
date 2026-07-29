@@ -8,6 +8,30 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 
+def reference_poses_from_xy(reference_xy, current_yaw):
+    reference_xy = np.asarray(reference_xy, dtype=np.float64)
+    if (
+        reference_xy.ndim != 2
+        or reference_xy.shape[1] != 2
+        or len(reference_xy) < 2
+    ):
+        raise ValueError("reference_xy must have shape (N, 2), N >= 2")
+
+    deltas = np.diff(reference_xy, axis=0)
+    valid = np.linalg.norm(deltas, axis=1) > np.finfo(np.float64).eps
+    if not np.any(valid):
+        yaws = np.full(len(reference_xy), current_yaw)
+        return np.column_stack((reference_xy, yaws))
+
+    valid_indices = np.flatnonzero(valid)
+    segment_yaws = np.unwrap(np.arctan2(deltas[valid, 1], deltas[valid, 0]))
+    yaws = np.interp(np.arange(len(reference_xy)), valid_indices, segment_yaws)
+    yaws += 2.0 * np.pi * np.round(
+        (current_yaw - yaws[0]) / (2.0 * np.pi)
+    )
+    return np.column_stack((reference_xy, yaws))
+
+
 class Mpc_controller:
     def __init__(
         self,

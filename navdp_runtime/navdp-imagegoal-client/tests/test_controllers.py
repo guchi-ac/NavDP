@@ -3,10 +3,42 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts.realworld.controllers import Mpc_controller
+from scripts.realworld.controllers import (
+    Mpc_controller,
+    reference_poses_from_xy,
+)
 
 
 class UpstreamNavdpMpcTests(unittest.TestCase):
+    def test_reference_pose_yaw_follows_guide_tangent(self):
+        poses = reference_poses_from_xy(
+            np.array([[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]]),
+            current_yaw=0.0,
+        )
+        np.testing.assert_allclose(poses[:, 2], np.pi / 2.0)
+
+    def test_reference_pose_yaw_uses_nearest_equivalent_at_wrap(self):
+        angle = np.deg2rad(-179.0)
+        points = np.array(
+            [[0.0, 0.0], [np.cos(angle), np.sin(angle)]]
+        )
+        poses = reference_poses_from_xy(
+            points,
+            current_yaw=np.deg2rad(179.0),
+        )
+        np.testing.assert_allclose(
+            poses[:, 2],
+            np.deg2rad(181.0),
+            atol=1e-12,
+        )
+
+    def test_reference_pose_yaw_handles_repeated_points(self):
+        poses = reference_poses_from_xy(
+            np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 0.0]]),
+            current_yaw=0.3,
+        )
+        np.testing.assert_allclose(poses[:, 2], 0.0)
+
     def test_uses_upstream_default_horizon_and_reference_gap(self):
         controller = Mpc_controller(
             np.array([[0.0, 0.0], [1.0, 0.0]])
