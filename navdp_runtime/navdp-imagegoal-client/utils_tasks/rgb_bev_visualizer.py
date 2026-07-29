@@ -202,6 +202,25 @@ def render_mpc_rgb_bev(
     selected_diffusion: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     image = np.zeros((config.size_px, config.size_px, 3), dtype=np.uint8)
+    centerline_pixels = _base_xy_to_pixels(
+        np.array(
+            [
+                [-config.rear_m, 0.0],
+                [config.forward_m, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        config,
+    )
+    cv2.line(
+        image,
+        tuple(int(value) for value in centerline_pixels[0]),
+        tuple(int(value) for value in centerline_pixels[1]),
+        (48, 48, 48),
+        1,
+        cv2.LINE_8,
+    )
+
     points, colors, ranges = backproject_rgbd_to_base(
         rgb_bgr,
         depth_m,

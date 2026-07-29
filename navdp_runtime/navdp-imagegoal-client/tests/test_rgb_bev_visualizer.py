@@ -161,6 +161,26 @@ class RenderingTests(unittest.TestCase):
 
         np.testing.assert_array_equal(frame[360, 360], [0, 0, 255])
 
+    def test_draws_thin_dark_centerline_without_odom(self):
+        frame = render_mpc_rgb_bev(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            np.zeros((2, 2), dtype=np.float32),
+            np.eye(3),
+            np.eye(4),
+            current_odom_xy_yaw=None,
+            odom_history=np.empty((0, 3)),
+            predicted_states=None,
+            command=np.zeros(2),
+            solve_ms=None,
+            odom_status="ODOM WAITING",
+            mpc_status="MPC STALE",
+            config=BevConfig(sample_stride=1),
+        )
+
+        np.testing.assert_array_equal(frame[200, 360], [48, 48, 48])
+        np.testing.assert_array_equal(frame[200, 359], [0, 0, 0])
+        np.testing.assert_array_equal(frame[200, 361], [0, 0, 0])
+
     def test_draws_cyan_selected_diffusion_under_yellow_guide_points(self):
         frame = render_mpc_rgb_bev(
             np.zeros((2, 2, 3), dtype=np.uint8),
