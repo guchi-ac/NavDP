@@ -53,6 +53,26 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
             atol=0.01,
         )
 
+    def test_update_reference_trajectory_preserves_warm_start(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [1.0, 0.0]]),
+            N=3,
+            ref_gap=1,
+        )
+        previous_controls = np.full((3, 2), 0.25)
+        previous_states = np.full((4, 3), 0.5)
+        controller.last_opt_u_controls = previous_controls
+        controller.last_opt_x_states = previous_states
+
+        controller.update_ref_traj(
+            np.array([[0.0, 0.0], [0.0, 2.0]])
+        )
+
+        np.testing.assert_allclose(controller.ref_traj[0], [0.0, 0.0])
+        np.testing.assert_allclose(controller.ref_traj[-1], [0.0, 2.0])
+        self.assertIs(controller.last_opt_u_controls, previous_controls)
+        self.assertIs(controller.last_opt_x_states, previous_states)
+
     def test_source_matches_upstream_cost_and_zero_yaw_reference(self):
         source = (
             Path(__file__).resolve().parents[1]
@@ -66,7 +86,6 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
         self.assertIn("np.zeros((ref_traj.shape[0], 1))", source)
         self.assertNotIn("reference_poses_from_xy", source)
         self.assertNotIn("blind_steps", source)
-        self.assertNotIn("update_ref_traj", source)
 
 
 if __name__ == "__main__":

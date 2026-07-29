@@ -57,7 +57,7 @@ MPC 速度默认发布到 `LocalNavAction` 实际订阅的 `/cmd_vel`。客户�
 不存在、goal 被拒绝、超时或返回失败时，客户端直接退出，不会启动底盘控制。
 Dry-run 不发送这两个 goal。
 
-MPC 默认限制为 `0.10 m/s` 和 `0.50 rad/s`，并原样发布到 `/cmd_vel`。
+MPC 默认限制为 `0.15 m/s` 和 `0.50 rad/s`，并原样发布到 `/cmd_vel`。
 MPC 使用 `/odom` 位姿中的 `[x, y, yaw]` 作为状态，并将线速度和角速度
 `[v, w]` 作为控制量。
 RGB-D 几何验证器第一帧进入
@@ -66,10 +66,15 @@ RGB-D 几何验证器第一帧进入
 
 ## 上游 NavDP MPC 与 D435 重投影
 
-客户端的轨迹/MPC 语义与
+客户端保留
 `InternRobotics/NavDP@bebb436a9856acbd6ed2a63234a99db6bac2fd3a`
-保持一致：每轮有效的 NavDP selected diffusion 都直接创建一个新的 MPC，
-不保存历史引导点、不补“底盘到首点”的盲区点，也不对引导点重新采样。
+的 MPC 参数，并采用
+`InternRobotics/InternNav@7a5c62400ac45b313d9b709c740b64191556a242`
+的在线轨迹交接方式：第一条有效轨迹创建 MPC，后续有效 selected diffusion
+只更新同一个 MPC 的 `ref_traj`，不清空上一次最优解的 warm start。控制线程
+发布完当前求解结果后，规划线程再原子更新参考轨迹；有效新规划不会在两个
+控制周期之间额外插入零速度。不保存历史引导点、不补“底盘到首点”的盲区点，
+也不对输入引导点重新采样。
 
 NavDP 原始 selected diffusion 使用真机
 `/cam_head/d435/color/camera_info` 发布的彩色相机内参，并按官方 RGB
@@ -90,8 +95,9 @@ selected 到黄色 guide 的控制几何。官方控制高度固定为 `0.2 m`�
 diffusion 引导点数量，也不会截断 diffusion 点。完整路径先按上游实现线性
 加密 50 倍，再从离底盘最近的位置起按目标弧长选参考点。`ref_gap=3` 表示
 每 3 个 MPC 步施加一次位置参考代价，因此 MPC 使用
-`N // ref_gap + 1 = 6` 个参考状态。默认 `--max-v 0.1` 时，相邻目标参考弧长
-约为 `0.1 * 3 * 0.1 = 0.03 m`。
+`N // ref_gap + 1 = 6` 个参考状态。MPC 的参考速度保持官方默认
+`desired_v=0.5`，因此相邻目标参考弧长约为
+`0.5 * 3 * 0.1 = 0.15 m`；最终发布线速度仍受默认 `--max-v 0.15` 限制。
 
 红色轨迹表示实际交给 MPC 的 `active_traj`；按 critic 着色的轨迹仍表示模型
 候选，便于观察重投影前后的差异。

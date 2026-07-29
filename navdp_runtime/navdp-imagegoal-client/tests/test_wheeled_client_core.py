@@ -1444,18 +1444,18 @@ class RosClientSourceTests(unittest.TestCase):
             source,
         )
         self.assertIn("next_mpc = Mpc_controller(", source)
-        self.assertIn("desired_v=self.args.max_v", source)
+        self.assertIn("desired_v=0.5", source)
         self.assertNotIn("TrajectoryManager", source)
         self.assertNotIn("trajectory_update", source)
         self.assertNotIn("blind_steps=", source)
         self.assertNotIn("N=trajectory_update", source)
         self.assertNotIn("retained_reprojected_world_xy", source)
 
-    def test_client_rebuilds_upstream_mpc_for_every_valid_plan(self):
+    def test_client_reuses_upstream_mpc_for_valid_plan_updates(self):
         source = self.client_source()
 
         self.assertIn("next_mpc = Mpc_controller(", source)
-        self.assertNotIn("self.mpc.update_ref_traj(", source)
+        self.assertIn("self.mpc.update_ref_traj(active_traj)", source)
         self.assertNotIn("prediction_steps", source)
 
     def test_client_gates_control_on_active_trajectory(self):
@@ -1478,7 +1478,8 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("self.latest_mpc_visualization = None", source)
         self.assertIn("tracking_generation_is_current(", source)
         self.assertIn("captured_generation=control_generation", source)
-        self.assertIn('reason = "plan_superseded"', source)
+        self.assertIn('reason = "tracking_invalidated"', source)
+        self.assertNotIn('reason = "plan_superseded"', source)
 
     def test_client_does_not_expose_trajectory_manager_options(self):
         source = self.client_source()

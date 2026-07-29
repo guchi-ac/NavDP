@@ -724,21 +724,24 @@ class NavdpImageGoalClient(Node):
                 )
             else:
                 try:
-                    next_mpc = Mpc_controller(
-                        active_traj,
-                        desired_v=self.args.max_v,
-                        v_max=self.args.max_v,
-                        w_max=self.args.max_w,
-                    )
                     next_active_traj = np.asarray(active_traj).copy()
                     next_active_traj.setflags(write=False)
-                    next_selected_state = (
-                        SelectedDiffusionInstallState()
-                        .stage(raw_selected_world_xy, True)
-                        .commit()
-                    )
                     with self.mpc_lock:
-                        self.mpc = next_mpc
+                        if self.mpc is None:
+                            next_mpc = Mpc_controller(
+                                active_traj,
+                                desired_v=0.5,
+                                v_max=self.args.max_v,
+                                w_max=self.args.max_w,
+                            )
+                            self.mpc = next_mpc
+                        else:
+                            self.mpc.update_ref_traj(active_traj)
+                        next_selected_state = (
+                            SelectedDiffusionInstallState()
+                            .stage(raw_selected_world_xy, True)
+                            .commit()
+                        )
                         self.installed_active_traj = next_active_traj
                         self.selected_diffusion_state = next_selected_state
                         with self.data_lock:
@@ -1038,7 +1041,6 @@ class NavdpImageGoalClient(Node):
                 last_odom_time = self.last_odom_time
                 last_plan_time = self.last_plan_time
                 plan_id = self.latest_plan_id
-                control_generation = self.trajectory_generation
                 reason = control_stop_reason(
                     now=cycle_start,
                     enable_control=self.args.enable_control,
@@ -1064,12 +1066,22 @@ class NavdpImageGoalClient(Node):
             reference_states = None
             solve_ms = None
             solve_started = None
+            control_generation = None
+            command_published = False
             if reason is None and latest_odom is not None:
                 try:
                     with self.mpc_lock:
                         if self.mpc is None:
                             reason = "mpc_missing"
                         else:
+                            with self.data_lock:
+                                control_generation = self.trajectory_generation
+                                plan_id = self.latest_plan_id
+                                if self.arrival_blocked:
+                                    reason = "arrival"
+                                elif not self.trajectory_ready:
+                                    reason = "tracking_invalidated"
+                        if reason is None:
                             reference_states = self.mpc.find_reference_traj(
                                 latest_odom,
                                 self.mpc.ref_traj,
@@ -1088,20 +1100,49 @@ class NavdpImageGoalClient(Node):
                             )
                             if selected_diffusion_snapshot is not None:
                                 selected_diffusion_snapshot.setflags(write=False)
-                    if reason is None:
-                        proposed_linear = float(
-                            np.clip(controls[0, 0], 0.0, self.args.max_v)
-                        )
-                        proposed_angular = float(
-                            np.clip(controls[0, 1], -self.args.max_w, self.args.max_w)
-                        )
-                        predicted_snapshot = np.asarray(predicted_states).copy()
-                        predicted_snapshot.setflags(write=False)
-                        command_snapshot = np.array(
-                            [proposed_linear, proposed_angular],
-                            dtype=np.float64,
-                        )
-                        command_snapshot.setflags(write=False)
+                            proposed_linear = float(
+                                np.clip(controls[0, 0], 0.0, self.args.max_v)
+                            )
+                            proposed_angular = float(
+                                np.clip(
+                                    controls[0, 1],
+                                    -self.args.max_w,
+                                    self.args.max_w,
+                                )
+                            )
+                            predicted_snapshot = np.asarray(
+                                predicted_states
+                            ).copy()
+                            predicted_snapshot.setflags(write=False)
+                            command_snapshot = np.array(
+                                [proposed_linear, proposed_angular],
+                                dtype=np.float64,
+                            )
+                            command_snapshot.setflags(write=False)
+                            with self.data_lock:
+                                if self.arrival_blocked:
+                                    reason = "arrival"
+                                elif not tracking_generation_is_current(
+                                    captured_generation=control_generation,
+                                    current_generation=self.trajectory_generation,
+                                    trajectory_ready=self.trajectory_ready,
+                                ):
+                                    reason = "tracking_invalidated"
+                                if reason is None:
+                                    linear = proposed_linear
+                                    angular = proposed_angular
+                                    self.latest_mpc_visualization = (
+                                        MpcVisualizationSnapshot(
+                                            predicted_states=predicted_snapshot,
+                                            active_traj=active_traj_snapshot,
+                                            selected_diffusion=selected_diffusion_snapshot,
+                                            command=command_snapshot,
+                                            solve_ms=float(solve_ms),
+                                            updated_at=time.monotonic(),
+                                        )
+                                    )
+                                self._publish_velocity(linear, angular)
+                                command_published = True
                 except Exception as error:
                     if solve_started is not None:
                         solve_ms = (
@@ -1110,30 +1151,9 @@ class NavdpImageGoalClient(Node):
                     reason = "mpc_error"
                     self.get_logger().error(f"MPC solve failed: {error}")
 
-            with self.data_lock:
-                if (
-                    reason is None
-                    and not tracking_generation_is_current(
-                        captured_generation=control_generation,
-                        current_generation=self.trajectory_generation,
-                        trajectory_ready=self.trajectory_ready,
-                    )
-                ):
-                    reason = "plan_superseded"
-                if reason is None:
-                    linear = proposed_linear
-                    angular = proposed_angular
-                    self.latest_mpc_visualization = (
-                        MpcVisualizationSnapshot(
-                            predicted_states=predicted_snapshot,
-                            active_traj=active_traj_snapshot,
-                            selected_diffusion=selected_diffusion_snapshot,
-                            command=command_snapshot,
-                            solve_ms=float(solve_ms),
-                            updated_at=time.monotonic(),
-                        )
-                    )
-                self._publish_velocity(linear, angular)
+            if not command_published:
+                with self.data_lock:
+                    self._publish_velocity(linear, angular)
             self._write_diagnostic(
                 {
                     "type": "control",
@@ -1290,10 +1310,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opencv-threads", type=int, default=2)
     parser.add_argument("--sync-slop", type=float, default=0.1)
     parser.add_argument("--plan-period", type=float, default=0.3)
-    parser.add_argument("--max-v", type=float, default=0.1)
-    parser.add_argument("--max-w", type=float, default=0.50)
+    parser.add_argument("--max-v", type=float, default=0.15)
+    parser.add_argument("--max-w", type=float, default=0.30)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
-    parser.add_argument("--arrival-distance", type=float, default=0.2)
+    parser.add_argument("--arrival-distance", type=float, default=0.5)
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)
     parser.add_argument("--min-inliers", type=int, default=6)

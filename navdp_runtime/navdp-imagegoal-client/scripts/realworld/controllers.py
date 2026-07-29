@@ -12,7 +12,7 @@ class Mpc_controller:
     def __init__(
         self,
         global_planed_traj,
-        N=15,
+        N=10,
         desired_v=0.5,
         v_max=0.5,
         w_max=0.5,
@@ -111,6 +111,11 @@ class Mpc_controller:
             ),
             axis=1,
         )
+
+    def update_ref_traj(self, global_planed_traj):
+        dense_ref_traj = self.make_ref_denser(global_planed_traj)
+        self.ref_traj = dense_ref_traj
+        self.ref_traj_len = self.N // self.ref_gap + 1
 
     def solve(self, x0):
         ref_traj = self.find_reference_traj(x0, self.ref_traj)
