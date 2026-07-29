@@ -591,6 +591,29 @@ class DiagnosticsWriterTests(unittest.TestCase):
             writer.close()
             writer.close()
 
+    def test_json_writer_serializes_nonfinite_scan_ranges_as_null(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "scan.jsonl"
+            writer = client_core.JsonlWriter(output)
+            writer.write(
+                {
+                    "type": "scan",
+                    "ranges": np.array(
+                        [0.0, np.nan, np.inf, -np.inf],
+                        dtype=np.float32,
+                    ),
+                }
+            )
+            writer.close()
+
+            text = output.read_text(encoding="utf-8")
+            self.assertNotIn("NaN", text)
+            self.assertNotIn("Infinity", text)
+            self.assertEqual(
+                json.loads(text)["ranges"],
+                [0.0, None, None, None],
+            )
+
 
 class VideoFinalizationTests(unittest.TestCase):
     def test_transcodes_mp4v_to_h264_before_atomic_publish(self):
