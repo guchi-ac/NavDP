@@ -1229,10 +1229,13 @@ class RosClientSourceTests(unittest.TestCase):
         )
         source = controller_path.read_text(encoding="utf-8")
 
-        self.assertIn("Q = np.diag([10.0, 10.0, 0.0])", source)
+        self.assertIn("Q = np.diag([10.0, 10.0, 5.0])", source)
         self.assertIn("R = np.diag([0.02, 0.15])", source)
-        self.assertIn("np.zeros((ref_traj.shape[0], 1))", source)
-        self.assertNotIn("reference_poses_from_xy", source)
+        self.assertIn(
+            "reference_poses_from_xy(ref_traj, x0[2])",
+            source,
+        )
+        self.assertNotIn("np.zeros((ref_traj.shape[0], 1))", source)
 
     def test_client_uses_pose_only_for_kinematic_mpc(self):
         client_path = (
@@ -1444,7 +1447,11 @@ class RosClientSourceTests(unittest.TestCase):
             source,
         )
         self.assertIn("next_mpc = Mpc_controller(", source)
-        self.assertIn("desired_v=0.5", source)
+        self.assertIn("desired_v=self.args.max_v", source)
+        self.assertIn(
+            'parser.add_argument("--max-w", type=float, default=0.50)',
+            source,
+        )
         self.assertNotIn("TrajectoryManager", source)
         self.assertNotIn("trajectory_update", source)
         self.assertNotIn("blind_steps=", source)

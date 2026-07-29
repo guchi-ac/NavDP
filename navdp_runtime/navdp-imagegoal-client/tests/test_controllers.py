@@ -105,6 +105,28 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
         self.assertIs(controller.last_opt_u_controls, previous_controls)
         self.assertIs(controller.last_opt_x_states, previous_states)
 
+    def test_straight_guide_keeps_angular_velocity_small(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [1.0, 0.0]]),
+            desired_v=0.15,
+            v_max=0.15,
+            w_max=0.5,
+        )
+        controls, _ = controller.solve(np.array([0.0, 0.0, 0.0]))
+        self.assertGreater(controls[0, 0], 0.05)
+        self.assertLess(abs(controls[0, 1]), 0.02)
+
+    def test_right_angle_guide_trades_linear_speed_for_angular_speed(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [0.0, 1.0]]),
+            desired_v=0.15,
+            v_max=0.15,
+            w_max=0.5,
+        )
+        controls, _ = controller.solve(np.array([0.0, 0.0, 0.0]))
+        self.assertLess(controls[0, 0], 0.03)
+        self.assertGreater(controls[0, 1], 0.2)
+
     def test_source_matches_upstream_cost_and_zero_yaw_reference(self):
         source = (
             Path(__file__).resolve().parents[1]
@@ -113,10 +135,13 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
             / "controllers.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("Q = np.diag([10.0, 10.0, 0.0])", source)
+        self.assertIn("Q = np.diag([10.0, 10.0, 5.0])", source)
         self.assertIn("R = np.diag([0.02, 0.15])", source)
-        self.assertIn("np.zeros((ref_traj.shape[0], 1))", source)
-        self.assertNotIn("reference_poses_from_xy", source)
+        self.assertIn(
+            "reference_poses_from_xy(ref_traj, x0[2])",
+            source,
+        )
+        self.assertNotIn("np.zeros((ref_traj.shape[0], 1))", source)
         self.assertNotIn("blind_steps", source)
 
 

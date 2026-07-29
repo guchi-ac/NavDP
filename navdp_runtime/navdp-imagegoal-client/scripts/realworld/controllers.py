@@ -36,7 +36,7 @@ class Mpc_controller:
     def __init__(
         self,
         global_planed_traj,
-        N=10,
+        N=15,
         desired_v=0.5,
         v_max=0.5,
         w_max=0.5,
@@ -72,7 +72,9 @@ class Mpc_controller:
             )
             opti.subject_to(opt_states[i + 1, :] == x_next)
 
-        Q = np.diag([10.0, 10.0, 0.0])
+        Q = np.diag([10.0, 10.0, 5.0])
+        Q_xy = Q[:2, :2]
+        Q_yaw = Q[2, 2]
         R = np.diag([0.02, 0.15])
         obj = 0
         for i in range(N):
@@ -81,13 +83,21 @@ class Mpc_controller:
             )
             if i % ref_gap == 0:
                 nn = i // ref_gap
-                pose_error = (
-                    opt_states[i, :]
-                    - opt_xs[nn * 3 : nn * 3 + 3].T
+                position_error = (
+                    opt_states[i, :2]
+                    - opt_xs[nn * 3 : nn * 3 + 2].T
                 )
-                obj = obj + ca.mtimes(
-                    [pose_error, Q, pose_error.T]
+                raw_yaw_error = (
+                    opt_states[i, 2] - opt_xs[nn * 3 + 2]
                 )
+                yaw_error = ca.atan2(
+                    ca.sin(raw_yaw_error),
+                    ca.cos(raw_yaw_error),
+                )
+                obj += ca.mtimes(
+                    [position_error, Q_xy, position_error.T]
+                )
+                obj += Q_yaw * yaw_error**2
         opti.minimize(obj)
 
         opti.subject_to(opti.bounded(0.0, v, v_max))
@@ -143,14 +153,8 @@ class Mpc_controller:
 
     def solve(self, x0):
         ref_traj = self.find_reference_traj(x0, self.ref_traj)
-        ref_traj = np.concatenate(
-            (
-                ref_traj,
-                np.zeros((ref_traj.shape[0], 1)),
-            ),
-            axis=1,
-        ).reshape(-1, 1)
-        self.opti.set_value(self.opt_xs, ref_traj.reshape(-1, 1))
+        ref_traj = reference_poses_from_xy(ref_traj, x0[2]).reshape(-1, 1)
+        self.opti.set_value(self.opt_xs, ref_traj)
         u0 = (
             np.zeros((self.N, 2))
             if self.last_opt_u_controls is None
