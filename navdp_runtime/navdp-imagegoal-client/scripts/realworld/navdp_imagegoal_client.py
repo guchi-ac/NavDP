@@ -33,7 +33,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time as RosTime
 from rclpy.utilities import remove_ros_args
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from tf2_ros import (
     Buffer,
     StaticTransformBroadcaster,
@@ -49,6 +49,14 @@ for import_path in (REPO_ROOT, SCRIPT_DIR):
 
 from controllers import Mpc_controller
 from utils_tasks.client_utils import imagegoal_step, navigator_close, navigator_reset
+from utils_tasks.laser_obstacle_map import (
+    LaserMapConfig,
+    LaserScanSnapshot,
+    laser_scan_association,
+    laser_scan_record,
+    make_laser_scan_snapshot,
+    nearest_scan_snapshot,
+)
 from utils_tasks.rgb_bev_visualizer import (
     BevConfig,
     bev_freshness,
@@ -80,6 +88,7 @@ from utils_tasks.wheeled_client_core import (
 @dataclass
 class FrameSnapshot:
     sequence: int
+    stamp_ns: int
     rgb_bgr: np.ndarray
     depth_m: np.ndarray
     intrinsic: np.ndarray
@@ -87,6 +96,8 @@ class FrameSnapshot:
     camera_xy_yaw: np.ndarray
     base_from_camera: np.ndarray
     received_at: float
+    laser_snapshot: Optional[LaserScanSnapshot]
+    scan_rgb_dt_s: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -147,6 +158,30 @@ class NavdpImageGoalClient(Node):
         self.mpc_bev_video_writer = None
         self.mpc_bev_video_failed = False
         self.bev_config = BevConfig(sample_stride=args.bev_sample_stride)
+        for name in (
+            "laser_x",
+            "laser_y",
+            "laser_yaw",
+            "scan_sync_slop",
+            "scan_timeout",
+            "laser_map_resolution",
+        ):
+            if not np.isfinite(getattr(args, name)):
+                raise ValueError(f"{name} must be finite")
+        if args.scan_sync_slop < 0.0:
+            raise ValueError("scan_sync_slop must be non-negative")
+        if args.scan_timeout <= 0.0:
+            raise ValueError("scan_timeout must be positive")
+        if args.laser_map_resolution <= 0.0:
+            raise ValueError("laser_map_resolution must be positive")
+        if not args.laser_frame:
+            raise ValueError("laser_frame must be non-empty")
+        self.laser_map_config = LaserMapConfig(
+            resolution_m=args.laser_map_resolution,
+            laser_x_m=args.laser_x,
+            laser_y_m=args.laser_y,
+            laser_yaw_rad=args.laser_yaw,
+        )
         mpc_log_dir = Path(args.mpc_log_dir).expanduser()
         self.mpc_diagnostics = JsonlWriter(
             mpc_log_dir / f"{run_stamp}_mpc.jsonl"
@@ -171,6 +206,10 @@ class NavdpImageGoalClient(Node):
         self.odom_history = deque(maxlen=600)
         self.latest_frame = None
         self.frame_sequence = 0
+        self.latest_scan: Optional[LaserScanSnapshot] = None
+        self.recent_scans = deque(maxlen=50)
+        self.scan_sequence = 0
+        self.last_scan_error_log = 0.0
         self.mpc = None
         self.installed_active_traj: Optional[np.ndarray] = None
         self.selected_diffusion_state = SelectedDiffusionInstallState()
@@ -202,6 +241,12 @@ class NavdpImageGoalClient(Node):
             args.odom_topic,
             self._odom_callback,
             10,
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            args.scan_topic,
+            self._scan_callback,
+            qos_profile_sensor_data,
         )
         self.rgb_sub = message_filters.Subscriber(
             self,
@@ -279,13 +324,20 @@ class NavdpImageGoalClient(Node):
         args = self.args
         mode = "ENABLED" if args.enable_control else "DRY-RUN"
         self.get_logger().info(
-            "client ready: mode=%s goal=%s cmd=%s camera_tf=%s<-%s video=%s mpc_log=%s max_v=%.2f max_w=%.2f"
+            "client ready: mode=%s goal=%s cmd=%s camera_tf=%s<-%s "
+            "scan=%s laser_frame=%s laser_xy_yaw=(%.3f,%.3f,%.3f) "
+            "video=%s mpc_log=%s max_v=%.2f max_w=%.2f"
             % (
                 mode,
                 args.goal_image,
                 args.cmd_topic,
                 args.base_frame,
                 args.camera_frame,
+                args.scan_topic,
+                args.laser_frame,
+                args.laser_x,
+                args.laser_y,
+                args.laser_yaw,
                 self.visualization_video_output,
                 self.mpc_diagnostics.path,
                 args.max_v,
@@ -406,6 +458,47 @@ class NavdpImageGoalClient(Node):
             self.last_odom_time = time.monotonic()
             self.odom_history.append(pose.copy())
 
+    def _scan_callback(self, message: LaserScan) -> None:
+        received_at = time.monotonic()
+        try:
+            if message.header.frame_id != self.args.laser_frame:
+                raise ValueError(
+                    "unexpected laser frame %r, expected %r"
+                    % (message.header.frame_id, self.args.laser_frame)
+                )
+            stamp_ns = (
+                int(message.header.stamp.sec) * 1_000_000_000
+                + int(message.header.stamp.nanosec)
+            )
+            with self.data_lock:
+                next_sequence = self.scan_sequence + 1
+                snapshot = make_laser_scan_snapshot(
+                    sequence=next_sequence,
+                    stamp_ns=stamp_ns,
+                    received_at=received_at,
+                    frame_id=message.header.frame_id,
+                    angle_min=message.angle_min,
+                    angle_increment=message.angle_increment,
+                    range_min=message.range_min,
+                    range_max=message.range_max,
+                    ranges=np.asarray(message.ranges, dtype=np.float32),
+                    odom_xy_yaw=(
+                        None
+                        if self.latest_odom is None
+                        else self.latest_odom.copy()
+                    ),
+                )
+                self.scan_sequence = next_sequence
+                self.latest_scan = snapshot
+                self.recent_scans.append(snapshot)
+            self._write_diagnostic(
+                laser_scan_record(snapshot, wall_time=time.time())
+            )
+        except Exception as error:
+            if received_at - self.last_scan_error_log >= 2.0:
+                self.get_logger().error(f"laser scan rejected: {error}")
+                self.last_scan_error_log = received_at
+
     def _write_diagnostic(self, record: dict) -> None:
         if self.mpc_diagnostics_failed:
             return
@@ -473,6 +566,10 @@ class NavdpImageGoalClient(Node):
 
     def _rgbd_callback(self, rgb_message: Image, depth_message: Image) -> None:
         try:
+            rgb_stamp_ns = (
+                int(rgb_message.header.stamp.sec) * 1_000_000_000
+                + int(rgb_message.header.stamp.nanosec)
+            )
             rgb_bgr = self.bridge.imgmsg_to_cv2(rgb_message, desired_encoding="bgr8")
             depth = np.asarray(
                 self.bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough")
@@ -503,9 +600,15 @@ class NavdpImageGoalClient(Node):
             with self.data_lock:
                 if self.intrinsic is None:
                     return
+                laser_snapshot, scan_rgb_dt_s = nearest_scan_snapshot(
+                    self.recent_scans,
+                    rgb_stamp_ns,
+                    self.args.scan_sync_slop,
+                )
                 self.frame_sequence += 1
                 snapshot = FrameSnapshot(
                     sequence=self.frame_sequence,
+                    stamp_ns=rgb_stamp_ns,
                     rgb_bgr=np.asarray(rgb_bgr).copy(),
                     depth_m=depth_m.copy(),
                     intrinsic=self.intrinsic.copy(),
@@ -515,6 +618,8 @@ class NavdpImageGoalClient(Node):
                     camera_xy_yaw=camera_xy_yaw,
                     base_from_camera=base_from_camera.copy(),
                     received_at=time.monotonic(),
+                    laser_snapshot=laser_snapshot,
+                    scan_rgb_dt_s=scan_rgb_dt_s,
                 )
                 self.latest_frame = snapshot
             self._queue_visualization(snapshot)
@@ -700,11 +805,12 @@ class NavdpImageGoalClient(Node):
 
             if active_traj is None:
                 self._invalidate_tracking_state()
+                diagnostic_time = time.monotonic()
                 self._write_diagnostic(
                     {
                         "type": "plan",
                         "wall_time": time.time(),
-                        "monotonic_time": time.monotonic(),
+                        "monotonic_time": diagnostic_time,
                         "frame_sequence": snapshot.sequence,
                         "critic": critic_max,
                         "snapshot_odom": snapshot.odom_xy_yaw,
@@ -719,6 +825,11 @@ class NavdpImageGoalClient(Node):
                         "active_traj": None,
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
+                        ),
+                        **laser_scan_association(
+                            snapshot.laser_snapshot,
+                            scan_rgb_dt_s=snapshot.scan_rgb_dt_s,
+                            now_monotonic=diagnostic_time,
                         ),
                     }
                 )
@@ -796,6 +907,11 @@ class NavdpImageGoalClient(Node):
                         "mpc_horizon": self.mpc.N,
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
+                        ),
+                        **laser_scan_association(
+                            snapshot.laser_snapshot,
+                            scan_rgb_dt_s=snapshot.scan_rgb_dt_s,
+                            now_monotonic=plan_ready,
                         ),
                     }
                 )
@@ -1041,6 +1157,7 @@ class NavdpImageGoalClient(Node):
                 last_odom_time = self.last_odom_time
                 last_plan_time = self.last_plan_time
                 plan_id = self.latest_plan_id
+                latest_scan = self.latest_scan
                 reason = control_stop_reason(
                     now=cycle_start,
                     enable_control=self.args.enable_control,
@@ -1180,6 +1297,14 @@ class NavdpImageGoalClient(Node):
                     "plan_age_s": None
                     if last_plan_time is None
                     else cycle_start - last_plan_time,
+                    "scan_sequence": (
+                        None if latest_scan is None else latest_scan.sequence
+                    ),
+                    "scan_age_s": (
+                        None
+                        if latest_scan is None
+                        else cycle_start - latest_scan.received_at
+                    ),
                 }
             )
             if (
@@ -1284,11 +1409,16 @@ def parse_args() -> argparse.Namespace:
         default="/cam_head/d435/color/camera_info",
     )
     parser.add_argument("--odom-topic", default="/odom")
+    parser.add_argument("--scan-topic", default="/scan")
     parser.add_argument("--cmd-topic", default="/cmd_vel")
     parser.add_argument("--posture-timeout", type=float, default=10.0)
     parser.add_argument("--local-nav-timeout", type=float, default=5.0)
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--camera-frame", default="d435_color_optical_frame")
+    parser.add_argument("--laser-frame", default="laser_frame")
+    parser.add_argument("--laser-x", type=float, default=0.042)
+    parser.add_argument("--laser-y", type=float, default=0.0)
+    parser.add_argument("--laser-yaw", type=float, default=0.0)
     parser.add_argument("--tf-timeout", type=float, default=0.2)
     parser.add_argument("--visualization-topic", default="/navdp/visualization")
     parser.add_argument(
@@ -1309,6 +1439,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-bev-timeout", type=float, default=0.5)
     parser.add_argument("--opencv-threads", type=int, default=2)
     parser.add_argument("--sync-slop", type=float, default=0.1)
+    parser.add_argument("--scan-sync-slop", type=float, default=0.10)
+    parser.add_argument("--scan-timeout", type=float, default=0.25)
+    parser.add_argument("--laser-map-resolution", type=float, default=0.05)
     parser.add_argument("--plan-period", type=float, default=0.3)
     parser.add_argument("--max-v", type=float, default=0.15)
     parser.add_argument("--max-w", type=float, default=0.50)

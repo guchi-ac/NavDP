@@ -6,6 +6,8 @@ import numpy as np
 from utils_tasks.laser_obstacle_map import (
     LaserMapConfig,
     build_current_obstacle_map,
+    laser_scan_record,
+    laser_scan_association,
     laser_points_in_target_base,
     make_laser_scan_snapshot,
     nearest_scan_snapshot,
@@ -94,6 +96,59 @@ class LaserSnapshotTests(unittest.TestCase):
 
         self.assertIsNone(paired)
         self.assertIsNone(delta)
+
+    def test_builds_raw_scan_record_without_losing_pairing_identity(self):
+        result = laser_scan_record(
+            snapshot(
+                sequence=17,
+                stamp_ns=2_500_000_000,
+                ranges=[0.0, math.nan, 1.25],
+                odom=(3.0, 4.0, 0.5),
+            ),
+            wall_time=20.0,
+        )
+
+        self.assertEqual(result["type"], "scan")
+        self.assertEqual(result["scan_sequence"], 17)
+        self.assertEqual(result["stamp_ns"], 2_500_000_000)
+        self.assertEqual(result["frame_id"], "laser_frame")
+        np.testing.assert_allclose(
+            result["ranges"][[0, 2]],
+            [0.0, 1.25],
+        )
+        self.assertTrue(math.isnan(result["ranges"][1]))
+        np.testing.assert_allclose(result["odom"], [3.0, 4.0, 0.5])
+
+    def test_builds_association_fields_and_age(self):
+        scan = snapshot(sequence=4, stamp_ns=1_050_000_000)
+
+        result = laser_scan_association(
+            scan,
+            scan_rgb_dt_s=0.05,
+            now_monotonic=10.08,
+        )
+
+        self.assertEqual(result["scan_sequence"], 4)
+        self.assertEqual(result["scan_stamp_ns"], 1_050_000_000)
+        self.assertAlmostEqual(result["scan_rgb_dt_s"], 0.05)
+        self.assertAlmostEqual(result["scan_age_s"], 0.08)
+
+    def test_missing_scan_has_explicit_null_association(self):
+        result = laser_scan_association(
+            None,
+            scan_rgb_dt_s=None,
+            now_monotonic=10.0,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "scan_sequence": None,
+                "scan_stamp_ns": None,
+                "scan_rgb_dt_s": None,
+                "scan_age_s": None,
+            },
+        )
 
 
 class LaserMapTests(unittest.TestCase):

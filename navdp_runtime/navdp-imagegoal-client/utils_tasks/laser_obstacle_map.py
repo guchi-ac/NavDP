@@ -143,6 +143,48 @@ def nearest_scan_snapshot(
     return selected, delta_s
 
 
+def laser_scan_record(
+    snapshot: LaserScanSnapshot,
+    *,
+    wall_time: float,
+) -> dict:
+    return {
+        "type": "scan",
+        "wall_time": float(wall_time),
+        "monotonic_time": snapshot.received_at,
+        "scan_sequence": snapshot.sequence,
+        "stamp_ns": snapshot.stamp_ns,
+        "frame_id": snapshot.frame_id,
+        "angle_min": snapshot.angle_min,
+        "angle_increment": snapshot.angle_increment,
+        "range_min": snapshot.range_min,
+        "range_max": snapshot.range_max,
+        "ranges": snapshot.ranges,
+        "odom": snapshot.odom_xy_yaw,
+    }
+
+
+def laser_scan_association(
+    snapshot: Optional[LaserScanSnapshot],
+    *,
+    scan_rgb_dt_s: Optional[float],
+    now_monotonic: float,
+) -> dict:
+    if snapshot is None:
+        return {
+            "scan_sequence": None,
+            "scan_stamp_ns": None,
+            "scan_rgb_dt_s": None,
+            "scan_age_s": None,
+        }
+    return {
+        "scan_sequence": snapshot.sequence,
+        "scan_stamp_ns": snapshot.stamp_ns,
+        "scan_rgb_dt_s": scan_rgb_dt_s,
+        "scan_age_s": float(now_monotonic) - snapshot.received_at,
+    }
+
+
 def build_current_obstacle_map(
     snapshot: LaserScanSnapshot,
     config: LaserMapConfig,
