@@ -529,10 +529,6 @@ def reproject_navdp_to_ground_base(
         raise ValueError(
             "virtual_reprojection: ground intersection must be forward"
         )
-    if np.any(np.diff(base_xy[:, 0]) < -1e-6):
-        raise ValueError(
-            "virtual_reprojection: trajectory reverses forward progress"
-        )
     return base_xy
 
 

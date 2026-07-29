@@ -185,19 +185,19 @@ class GeometryTests(unittest.TestCase):
                 base_from_camera=self.level_optical_transform(0.2),
             )
 
-    def test_ground_reprojection_rejects_reversed_forward_progress(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "virtual_reprojection: trajectory reverses forward progress",
-        ):
-            client_core.reproject_navdp_to_ground_base(
-                np.array([[2.0, 0.0], [1.0, 0.0]]),
-                np.array(
-                    [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
-                ),
-                image_height=5,
-                base_from_camera=self.level_optical_transform(0.2),
-            )
+    def test_ground_reprojection_preserves_reversed_forward_progress(self):
+        trajectory = np.array([[2.0, 0.0], [1.0, 0.0]])
+
+        reprojected = client_core.reproject_navdp_to_ground_base(
+            trajectory,
+            np.array(
+                [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+            ),
+            image_height=5,
+            base_from_camera=self.level_optical_transform(0.2),
+        )
+
+        np.testing.assert_allclose(reprojected, trajectory, atol=1e-12)
 
     def test_normalizes_direct_tracking_trajectory_without_resampling(self):
         trajectory = np.array(
