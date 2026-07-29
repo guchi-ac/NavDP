@@ -1220,7 +1220,7 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("bebb436a9856acbd6ed2a63234a99db6bac2fd3a", source)
         self.assertIn("class Mpc_controller", source)
 
-    def test_controller_cost_matches_upstream_zero_yaw_reference(self):
+    def test_controller_uses_guide_yaw_reference_and_tuned_cost(self):
         controller_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"

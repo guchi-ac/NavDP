@@ -68,9 +68,12 @@ RGB-D 几何验证器第一帧进入
 
 ## 上游 NavDP MPC 与 D435 重投影
 
-客户端保留
+客户端以
 `InternRobotics/NavDP@bebb436a9856acbd6ed2a63234a99db6bac2fd3a`
-的 MPC 参数，并采用
+的 MPC 结构为基础，保留 `N=15`、`T=0.1`、`ref_gap=3` 和
+`R=diag([0.02, 0.15])`。为跟踪 guide 方向并匹配真机速度，本部署有意将
+yaw 代价权重从上游的 `0` 改为 `5`，并将参考速度从上游默认的
+`desired_v=0.5` 改为 `desired_v=--max-v`。客户端采用
 `InternRobotics/InternNav@7a5c62400ac45b313d9b709c740b64191556a242`
 的在线轨迹交接方式：第一条有效轨迹创建 MPC，后续有效 selected diffusion
 只更新同一个 MPC 的 `ref_traj`，不清空上一次最优解的 warm start。控制线程

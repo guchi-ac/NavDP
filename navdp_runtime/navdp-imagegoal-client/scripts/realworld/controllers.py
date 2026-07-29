@@ -25,7 +25,11 @@ def reference_poses_from_xy(reference_xy, current_yaw):
 
     valid_indices = np.flatnonzero(valid)
     segment_yaws = np.unwrap(np.arctan2(deltas[valid, 1], deltas[valid, 0]))
-    yaws = np.interp(np.arange(len(reference_xy)), valid_indices, segment_yaws)
+    pose_indices = np.arange(len(reference_xy))
+    nearest_valid = np.abs(
+        pose_indices[:, np.newaxis] - valid_indices
+    ).argmin(axis=1)
+    yaws = segment_yaws[nearest_valid]
     yaws += 2.0 * np.pi * np.round(
         (current_yaw - yaws[0]) / (2.0 * np.pi)
     )
