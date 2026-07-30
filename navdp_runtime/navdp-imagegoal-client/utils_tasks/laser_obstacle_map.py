@@ -295,3 +295,33 @@ def laser_points_in_target_base(
     target_x = target_c * delta_x + target_s * delta_y
     target_y = -target_s * delta_x + target_c * delta_y
     return np.column_stack((target_x, target_y))
+
+
+def laser_bev_obstacles(
+    snapshot: Optional[LaserScanSnapshot],
+    *,
+    target_odom_xy_yaw: Optional[np.ndarray],
+    now_monotonic: float,
+    timeout_s: float,
+    config: LaserMapConfig,
+) -> Tuple[Optional[np.ndarray], str, Optional[float]]:
+    if not np.isfinite(timeout_s) or timeout_s <= 0.0:
+        raise ValueError("timeout_s must be finite and positive")
+    if snapshot is None:
+        return None, "LASER WAITING", None
+
+    age_s = float(now_monotonic) - snapshot.received_at
+    if age_s > timeout_s:
+        return None, "LASER STALE", age_s
+
+    obstacle_map = build_current_obstacle_map(snapshot, config)
+    obstacle_xy = laser_points_in_target_base(
+        obstacle_map.obstacle_xy,
+        snapshot.odom_xy_yaw,
+        target_odom_xy_yaw,
+    )
+    return (
+        obstacle_xy,
+        f"LASER OK points={obstacle_map.valid_count}",
+        age_s,
+    )

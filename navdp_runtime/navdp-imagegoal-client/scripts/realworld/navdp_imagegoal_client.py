@@ -52,6 +52,7 @@ from utils_tasks.client_utils import imagegoal_step, navigator_close, navigator_
 from utils_tasks.laser_obstacle_map import (
     LaserMapConfig,
     LaserScanSnapshot,
+    laser_bev_obstacles,
     laser_scan_association,
     laser_scan_record,
     make_laser_scan_snapshot,
@@ -210,6 +211,7 @@ class NavdpImageGoalClient(Node):
         self.recent_scans = deque(maxlen=50)
         self.scan_sequence = 0
         self.last_scan_error_log = 0.0
+        self.last_laser_map_error_log = 0.0
         self.mpc = None
         self.installed_active_traj: Optional[np.ndarray] = None
         self.selected_diffusion_state = SelectedDiffusionInstallState()
@@ -1054,6 +1056,27 @@ class NavdpImageGoalClient(Node):
             mpc_snapshot = self.latest_mpc_visualization
 
         now = time.monotonic()
+        try:
+            laser_obstacle_xy, laser_status, laser_age_s = (
+                laser_bev_obstacles(
+                    snapshot.laser_snapshot,
+                    target_odom_xy_yaw=frame_odom,
+                    now_monotonic=now,
+                    timeout_s=self.args.scan_timeout,
+                    config=self.laser_map_config,
+                )
+            )
+        except Exception as error:
+            laser_obstacle_xy = None
+            laser_status = "LASER ERROR"
+            laser_age_s = (
+                None
+                if snapshot.laser_snapshot is None
+                else now - snapshot.laser_snapshot.received_at
+            )
+            if now - self.last_laser_map_error_log >= 2.0:
+                self.get_logger().error(f"laser map rendering failed: {error}")
+                self.last_laser_map_error_log = now
         mpc_updated_at = (
             None if mpc_snapshot is None else mpc_snapshot.updated_at
         )
@@ -1096,6 +1119,9 @@ class NavdpImageGoalClient(Node):
             actual_velocity=actual_velocity,
             active_traj=active_traj,
             selected_diffusion=selected_diffusion,
+            laser_obstacle_xy=laser_obstacle_xy,
+            laser_status=laser_status,
+            laser_age_s=laser_age_s,
         )
 
     def _append_mpc_bev_video(self, snapshot: FrameSnapshot) -> None:

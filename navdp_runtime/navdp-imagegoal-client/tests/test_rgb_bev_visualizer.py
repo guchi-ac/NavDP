@@ -8,6 +8,7 @@ from utils_tasks.rgb_bev_visualizer import (
     BevConfig,
     backproject_rgbd_to_base,
     bev_freshness,
+    bev_status_line,
     render_mpc_rgb_bev,
     world_xy_to_current_base,
 )
@@ -57,6 +58,26 @@ class ProjectionTests(unittest.TestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_formats_laser_freshness_in_combined_bev_status(self):
+        self.assertEqual(
+            bev_status_line(
+                "ODOM OK",
+                "MPC OK",
+                "LASER OK points=2",
+                0.03,
+            ),
+            "ODOM OK  MPC OK  LASER OK points=2 age=0.030 s",
+        )
+        self.assertEqual(
+            bev_status_line(
+                "ODOM WAITING",
+                "MPC STALE",
+                "LASER WAITING",
+                None,
+            ),
+            "ODOM WAITING  MPC STALE  LASER WAITING",
+        )
+
     def test_formats_desired_and_actual_velocity_as_separate_lines(self):
         self.assertTrue(hasattr(rgb_bev_visualizer, "velocity_overlay_lines"))
         lines = rgb_bev_visualizer.velocity_overlay_lines(
@@ -207,6 +228,62 @@ class RenderingTests(unittest.TestCase):
         np.testing.assert_array_equal(frame[495, 315], [0, 255, 255])
         np.testing.assert_array_equal(frame[96, 205], [255, 255, 0])
         np.testing.assert_array_equal(frame[96, 325], [0, 255, 255])
+
+    def test_draws_magenta_laser_hit_below_yellow_guide(self):
+        frame = render_mpc_rgb_bev(
+            np.zeros((2, 2, 3), dtype=np.uint8),
+            np.zeros((2, 2), dtype=np.float32),
+            np.eye(3),
+            np.eye(4),
+            current_odom_xy_yaw=np.zeros(3),
+            odom_history=np.empty((0, 3)),
+            predicted_states=None,
+            active_traj=np.array([[1.0, 0.0], [1.1, 0.0]]),
+            command=np.zeros(2),
+            solve_ms=None,
+            odom_status="ODOM OK",
+            mpc_status="MPC OK",
+            laser_obstacle_xy=np.array([[1.0, 0.0], [1.0, 0.5]]),
+            laser_status="LASER OK points=2",
+            laser_age_s=0.03,
+            config=BevConfig(sample_stride=1),
+        )
+
+        np.testing.assert_array_equal(frame[450, 360], [0, 255, 255])
+        self.assertTrue(
+            np.all(
+                frame[446:455, 311:320] == [255, 0, 255],
+                axis=2,
+            ).any()
+        )
+        np.testing.assert_array_equal(frame[96, 420], [255, 0, 255])
+
+    def test_waiting_or_stale_laser_does_not_draw_old_hits(self):
+        for status in ("LASER WAITING", "LASER STALE"):
+            with self.subTest(status=status):
+                frame = render_mpc_rgb_bev(
+                    np.zeros((2, 2, 3), dtype=np.uint8),
+                    np.zeros((2, 2), dtype=np.float32),
+                    np.eye(3),
+                    np.eye(4),
+                    current_odom_xy_yaw=np.zeros(3),
+                    odom_history=np.empty((0, 3)),
+                    predicted_states=None,
+                    command=np.zeros(2),
+                    solve_ms=None,
+                    odom_status="ODOM OK",
+                    mpc_status="MPC STALE",
+                    laser_obstacle_xy=np.array([[1.0, 0.0]]),
+                    laser_status=status,
+                    config=BevConfig(sample_stride=1),
+                )
+
+                self.assertFalse(
+                    np.all(
+                        frame[446:455, 356:365] == [255, 0, 255],
+                        axis=2,
+                    ).any()
+                )
 
     def test_draws_uniform_discrete_diffusion_guides_without_chassis_anchor(self):
         frame = render_mpc_rgb_bev(

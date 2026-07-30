@@ -6,6 +6,7 @@ import numpy as np
 from utils_tasks.laser_obstacle_map import (
     LaserMapConfig,
     build_current_obstacle_map,
+    laser_bev_obstacles,
     laser_scan_record,
     laser_scan_association,
     laser_points_in_target_base,
@@ -152,6 +153,42 @@ class LaserSnapshotTests(unittest.TestCase):
 
 
 class LaserMapTests(unittest.TestCase):
+    def test_prepares_only_fresh_scan_hits_for_bev(self):
+        scan = snapshot(ranges=[1.0], odom=(0.0, 0.0, 0.0))
+
+        points, status, age = laser_bev_obstacles(
+            scan,
+            target_odom_xy_yaw=np.array([0.1, 0.0, 0.0]),
+            now_monotonic=10.03,
+            timeout_s=0.25,
+            config=LaserMapConfig(),
+        )
+
+        np.testing.assert_allclose(points, [[0.942, 0.0]], atol=1e-6)
+        self.assertEqual(status, "LASER OK points=1")
+        self.assertAlmostEqual(age, 0.03)
+
+    def test_hides_missing_and_stale_scan_hits_from_bev(self):
+        waiting = laser_bev_obstacles(
+            None,
+            target_odom_xy_yaw=np.zeros(3),
+            now_monotonic=10.0,
+            timeout_s=0.25,
+            config=LaserMapConfig(),
+        )
+        stale = laser_bev_obstacles(
+            snapshot(ranges=[1.0]),
+            target_odom_xy_yaw=np.zeros(3),
+            now_monotonic=10.26,
+            timeout_s=0.25,
+            config=LaserMapConfig(),
+        )
+
+        self.assertEqual(waiting, (None, "LASER WAITING", None))
+        self.assertIsNone(stale[0])
+        self.assertEqual(stale[1], "LASER STALE")
+        self.assertAlmostEqual(stale[2], 0.26)
+
     def test_projects_hit_with_mira3_laser_offset(self):
         result = build_current_obstacle_map(
             snapshot(ranges=[1.0]),
