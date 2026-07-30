@@ -97,6 +97,19 @@ frame、plan 过期，critic 不安全，到达目标，机器人原点不安全
 - 起点碰撞连续 3 个规划周期消失后，认为本次避障事件结束并解除锁存；之后
   若再次出现满足上述条件的新强制停车事件，才允许重新启用一次。
 
+事件身份不使用 `plan_id`、frame sequence 或 trajectory generation。状态采用
+跨规划周期锁存的三相状态：
+
+1. `idle`：没有起点碰撞事件；新的有效起点逃逸 guide 可进入 `rotating`。
+2. `rotating`：强制 `v=0` 直到对齐；重新规划只能更新当前 guide 和航向目标，
+   不得创建新事件或重置对齐过程。
+3. `released`：已经对齐并恢复 MPC 线速度；只要后续规划仍然检测到起点碰撞，
+   无论轨迹、侧向选择、航向目标或 generation 如何变化，都保持 `released`，
+   不得再次强制 `v=0`。
+
+只有连续 3 个规划周期没有起点碰撞，`released` 才返回 `idle`。因此同一次
+持续起点碰撞不会因为每 `0.3 s` 重规划而反复进入原地转向。
+
 现有 scan、odom、frame、plan 和轨迹 generation 安全门保持不变；任何安全门
 失败仍立即发布零速度。
 
@@ -126,6 +139,8 @@ frame、plan 过期，critic 不安全，到达目标，机器人原点不安全
 - `rotate_first` 且航向未对齐时，线速度必须为零，角速度保留正确方向。
 - 误差小于 `5°` 后恢复 MPC 线速度。
 - 同一避障事件中误差重新增大时不得再次进入 `rotate_first`。
+- 连续起点碰撞期间反复改变 `plan_id` 和 trajectory generation，状态仍保持
+  `released`，线速度不得被再次强制为零。
 - 起点碰撞连续 3 个规划周期消失后，新的起点碰撞事件可以再次启用
   `rotate_first`。
 - scan 过期、轨迹失效或 generation 变化但新 guide 尚未安装时，不得使用
