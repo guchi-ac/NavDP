@@ -199,6 +199,38 @@ NavDP 官方没有语义分割输出。这里复用官方真机评测的
 NAVDP_BLAS_THREADS=2
 ```
 
+### 雷达诊断
+
+客户端直接订阅 `/scan`，不读取 `/costmap` 或 `/costmap_local`。每帧原始
+`LaserScan` 以 `type="scan"` 写入同一个 `*_mpc.jsonl`；`plan` 和
+`control` 记录通过 `scan_sequence` 与雷达帧关联，`plan` 还保存 RGB 与雷达
+时间戳之差 `scan_rgb_dt_s`。
+
+当前二值图由客户端独立生成：`0` 表示本帧没有命中，`100` 表示本帧有效回波
+终点。它不表示未知空间，也不继承任何第三方代价值。地图范围与 BEV 一致，
+前方 `6 m`、后方 `2 m`、左右各 `4 m`，默认分辨率 `0.05 m`。零值、非有限
+值、量程外数据和落在底盘自身矩形内的回波会被忽略。
+
+MPC RGB BEV 中洋红点表示与 RGB 帧时间最近且仍新鲜的雷达命中。状态为
+`LASER WAITING`、`LASER STALE` 或 `LASER ERROR` 时不绘制旧点。洋红雷达层
+位于 selected、guide 和 MPC 轨迹下方，便于直接观察当前轨迹是否穿过障碍。
+
+相关参数及默认值：
+
+```text
+--scan-topic /scan
+--laser-frame laser_frame
+--laser-x 0.042
+--laser-y 0.0
+--laser-yaw 0.0
+--scan-sync-slop 0.10
+--scan-timeout 0.25
+--laser-map-resolution 0.05
+```
+
+其中 `laser-x/y/yaw` 是已核对的 Mira3 平面激光外参。本版本只记录和显示
+雷达，不改变 NavDP selected、MPC、控制停止条件或 `/cmd_vel`。
+
 客户端持续发布 `/navdp/visualization`，并原子更新：
 
 ```text
