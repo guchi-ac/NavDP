@@ -24,7 +24,7 @@ data QoS。实机探测结果为：
 - 无效回波主要编码为 `0.0`。
 
 Mira3 URDF 中 `base_link -> laser_link` 的固定安装位姿为
-`x=0.042 m, y=0, yaw=0`。当前系统没有广播 `laser_frame` 对应 TF，因此客户
+`x=0.042 m, y=0, yaw=pi`。当前系统没有广播 `laser_frame` 对应 TF，因此客户
 端显式使用这组平面外参，并要求消息 `frame_id` 与配置的
 `--laser-frame=laser_frame` 一致。frame 不一致时拒绝该帧并限频报错，不猜测
 变换。
@@ -36,13 +36,15 @@ Mira3 URDF 中 `base_link -> laser_link` 的固定安装位姿为
 --laser-frame laser_frame
 --laser-x 0.042
 --laser-y 0.0
---laser-yaw 0.0
+--laser-yaw 3.141592653589793
 --scan-sync-slop 0.25
 --scan-timeout 0.25
 --laser-map-resolution 0.05
 ```
 
-The `0.25 s` synchronization window reflects the online driver measurement:
+The Mira3 driver defines scan `-180 deg` as robot-forward and `0 deg` as
+robot-rear, so the logical `laser_frame` requires a planar `pi rad` yaw into
+`base_link`. The `0.25 s` synchronization window reflects the online driver measurement:
 the newest laser header stamp trails RGB by `0.151–0.227 s`. Pairing still
 selects the nearest scan inside that bounded window.
 

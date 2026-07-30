@@ -162,8 +162,33 @@ class LaserSnapshotTests(unittest.TestCase):
 
 
 class LaserMapTests(unittest.TestCase):
+    def test_mira3_scan_angles_map_minus_180_forward_and_minus_90_left(self):
+        forward = build_current_obstacle_map(
+            snapshot(ranges=[1.0], angle_min=-math.pi),
+            LaserMapConfig(),
+        )
+        left = build_current_obstacle_map(
+            snapshot(ranges=[1.0], angle_min=-math.pi / 2),
+            LaserMapConfig(),
+        )
+
+        np.testing.assert_allclose(
+            forward.obstacle_xy,
+            [[1.042, 0.0]],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            left.obstacle_xy,
+            [[0.042, 1.0]],
+            atol=1e-6,
+        )
+
     def test_prepares_only_fresh_scan_hits_for_bev(self):
-        scan = snapshot(ranges=[1.0], odom=(0.0, 0.0, 0.0))
+        scan = snapshot(
+            ranges=[1.0],
+            angle_min=-math.pi,
+            odom=(0.0, 0.0, 0.0),
+        )
 
         points, status, age = laser_bev_obstacles(
             scan,
@@ -200,7 +225,7 @@ class LaserMapTests(unittest.TestCase):
 
     def test_projects_hit_with_mira3_laser_offset(self):
         result = build_current_obstacle_map(
-            snapshot(ranges=[1.0]),
+            snapshot(ranges=[1.0], angle_min=-math.pi),
             LaserMapConfig(),
         )
 
@@ -228,13 +253,13 @@ class LaserMapTests(unittest.TestCase):
 
         self.assertEqual(result.self_filtered_count, 1)
         self.assertEqual(result.valid_count, 1)
-        np.testing.assert_allclose(result.obstacle_xy, [[-0.958, 0.0]], atol=1e-6)
+        np.testing.assert_allclose(result.obstacle_xy, [[1.042, 0.0]], atol=1e-6)
 
     def test_places_hit_in_expected_grid_cell(self):
         config = LaserMapConfig(resolution_m=0.05)
 
         result = build_current_obstacle_map(
-            snapshot(ranges=[1.0]),
+            snapshot(ranges=[1.0], angle_min=-math.pi),
             config,
         )
 

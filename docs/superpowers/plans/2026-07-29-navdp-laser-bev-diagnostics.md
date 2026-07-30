@@ -13,7 +13,7 @@
 - Do not read `/costmap` or `/costmap_local`.
 - Do not use laser state in `control_stop_reason`, candidate selection, MPC construction, MPC solve, or `/cmd_vel` publication.
 - Default scan topic is `/scan`; expected frame is `laser_frame`.
-- Use the audited Mira3 planar laser extrinsic `x=0.042 m`, `y=0`, `yaw=0`.
+- Use the audited Mira3 planar laser extrinsic `x=0.042 m`, `y=0`, `yaw=pi`; the vendor `/scan` convention maps `-180 deg` to robot-forward.
 - Use `0.25 s` RGB/scan synchronization slop and `0.25 s` visualization freshness timeout. The synchronization default covers the measured `0.151–0.227 s` laser-header lag relative to RGB.
 - Use a `0.05 m` map resolution over the existing BEV bounds: forward `6 m`, rear `2 m`, lateral `±4 m`.
 - Map semantics are local and explicit: `0=current scan has no hit`, `100=current valid laser hit`.
@@ -48,7 +48,7 @@
 - Test: `navdp_runtime/navdp-imagegoal-client/tests/test_wheeled_client_core.py`
 
 **Interfaces:**
-- Produces: `LaserMapConfig(forward_m=6.0, rear_m=2.0, lateral_m=4.0, resolution_m=0.05, laser_x_m=0.042, laser_y_m=0.0, laser_yaw_rad=0.0, self_half_length_m=0.255, self_half_width_m=0.260)`.
+- Produces: `LaserMapConfig(forward_m=6.0, rear_m=2.0, lateral_m=4.0, resolution_m=0.05, laser_x_m=0.042, laser_y_m=0.0, laser_yaw_rad=pi, self_half_length_m=0.255, self_half_width_m=0.260)`.
 - Produces: immutable `LaserScanSnapshot(sequence, stamp_ns, received_at, frame_id, angle_min, angle_increment, range_min, range_max, ranges, odom_xy_yaw)`.
 - Produces: immutable `LaserObstacleMap(grid, obstacle_xy, valid_count, invalid_count, self_filtered_count)`.
 - Produces: `make_laser_scan_snapshot(...) -> LaserScanSnapshot`.
@@ -271,7 +271,7 @@ class LaserMapConfig:
     resolution_m: float = 0.05
     laser_x_m: float = 0.042
     laser_y_m: float = 0.0
-    laser_yaw_rad: float = 0.0
+    laser_yaw_rad: float = MIRA3_LASER_YAW_RAD
     self_half_length_m: float = 0.255
     self_half_width_m: float = 0.260
 
@@ -478,7 +478,7 @@ for required in (
     'parser.add_argument("--laser-frame", default="laser_frame")',
     'parser.add_argument("--laser-x", type=float, default=0.042)',
     'parser.add_argument("--laser-y", type=float, default=0.0)',
-    'parser.add_argument("--laser-yaw", type=float, default=0.0)',
+    'parser.add_argument("--laser-yaw", type=float, default=MIRA3_LASER_YAW_RAD)',
     'parser.add_argument("--scan-sync-slop", type=float, default=0.25)',
     'parser.add_argument("--scan-timeout", type=float, default=0.25)',
     'parser.add_argument("--laser-map-resolution", type=float, default=0.05)',

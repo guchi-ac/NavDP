@@ -51,6 +51,7 @@ from controllers import Mpc_controller
 from utils_tasks.client_utils import imagegoal_step, navigator_close, navigator_reset
 from utils_tasks.laser_obstacle_map import (
     DEFAULT_SCAN_SYNC_SLOP_S,
+    MIRA3_LASER_YAW_RAD,
     LaserMapConfig,
     LaserScanSnapshot,
     laser_bev_obstacles,
@@ -1445,7 +1446,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--laser-frame", default="laser_frame")
     parser.add_argument("--laser-x", type=float, default=0.042)
     parser.add_argument("--laser-y", type=float, default=0.0)
-    parser.add_argument("--laser-yaw", type=float, default=0.0)
+    parser.add_argument(
+        "--laser-yaw",
+        type=float,
+        default=MIRA3_LASER_YAW_RAD,
+    )
     parser.add_argument("--tf-timeout", type=float, default=0.2)
     parser.add_argument("--visualization-topic", default="/navdp/visualization")
     parser.add_argument(

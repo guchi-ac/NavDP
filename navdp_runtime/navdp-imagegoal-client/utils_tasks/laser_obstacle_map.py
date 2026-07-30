@@ -5,6 +5,7 @@ import numpy as np
 
 
 DEFAULT_SCAN_SYNC_SLOP_S = 0.25
+MIRA3_LASER_YAW_RAD = float(np.pi)
 
 
 @dataclass(frozen=True)
@@ -15,7 +16,7 @@ class LaserMapConfig:
     resolution_m: float = 0.05
     laser_x_m: float = 0.042
     laser_y_m: float = 0.0
-    laser_yaw_rad: float = 0.0
+    laser_yaw_rad: float = MIRA3_LASER_YAW_RAD
     self_half_length_m: float = 0.255
     self_half_width_m: float = 0.260
 
