@@ -4,6 +4,9 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 
+DEFAULT_SCAN_SYNC_SLOP_S = 0.25
+
+
 @dataclass(frozen=True)
 class LaserMapConfig:
     forward_m: float = 6.0
@@ -129,7 +132,7 @@ def make_laser_scan_snapshot(
 def nearest_scan_snapshot(
     scans: Sequence[LaserScanSnapshot],
     target_stamp_ns: int,
-    max_delta_s: float,
+    max_delta_s: float = DEFAULT_SCAN_SYNC_SLOP_S,
 ) -> Tuple[Optional[LaserScanSnapshot], Optional[float]]:
     if not np.isfinite(max_delta_s) or max_delta_s < 0.0:
         raise ValueError("max_delta_s must be finite and non-negative")

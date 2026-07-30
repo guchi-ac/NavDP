@@ -98,6 +98,15 @@ class LaserSnapshotTests(unittest.TestCase):
         self.assertIsNone(paired)
         self.assertIsNone(delta)
 
+    def test_default_sync_window_accepts_measured_sensor_stamp_offset(self):
+        paired, delta = nearest_scan_snapshot(
+            [snapshot(sequence=9, stamp_ns=780_000_000)],
+            target_stamp_ns=1_000_000_000,
+        )
+
+        self.assertEqual(paired.sequence, 9)
+        self.assertAlmostEqual(delta, -0.22)
+
     def test_builds_raw_scan_record_without_losing_pairing_identity(self):
         result = laser_scan_record(
             snapshot(

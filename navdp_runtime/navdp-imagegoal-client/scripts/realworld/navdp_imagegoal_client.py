@@ -50,6 +50,7 @@ for import_path in (REPO_ROOT, SCRIPT_DIR):
 from controllers import Mpc_controller
 from utils_tasks.client_utils import imagegoal_step, navigator_close, navigator_reset
 from utils_tasks.laser_obstacle_map import (
+    DEFAULT_SCAN_SYNC_SLOP_S,
     LaserMapConfig,
     LaserScanSnapshot,
     laser_bev_obstacles,
@@ -1465,7 +1466,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-bev-timeout", type=float, default=0.5)
     parser.add_argument("--opencv-threads", type=int, default=2)
     parser.add_argument("--sync-slop", type=float, default=0.1)
-    parser.add_argument("--scan-sync-slop", type=float, default=0.10)
+    parser.add_argument(
+        "--scan-sync-slop",
+        type=float,
+        default=DEFAULT_SCAN_SYNC_SLOP_S,
+    )
     parser.add_argument("--scan-timeout", type=float, default=0.25)
     parser.add_argument("--laser-map-resolution", type=float, default=0.05)
     parser.add_argument("--plan-period", type=float, default=0.3)

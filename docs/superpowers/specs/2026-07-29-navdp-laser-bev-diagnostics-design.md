@@ -37,10 +37,14 @@ Mira3 URDF 中 `base_link -> laser_link` 的固定安装位姿为
 --laser-x 0.042
 --laser-y 0.0
 --laser-yaw 0.0
---scan-sync-slop 0.10
+--scan-sync-slop 0.25
 --scan-timeout 0.25
 --laser-map-resolution 0.05
 ```
+
+The `0.25 s` synchronization window reflects the online driver measurement:
+the newest laser header stamp trails RGB by `0.151–0.227 s`. Pairing still
+selects the nearest scan inside that bounded window.
 
 所有距离、角度和超时参数必须有限；地图分辨率和超时必须为正数。
 

@@ -14,7 +14,7 @@
 - Do not use laser state in `control_stop_reason`, candidate selection, MPC construction, MPC solve, or `/cmd_vel` publication.
 - Default scan topic is `/scan`; expected frame is `laser_frame`.
 - Use the audited Mira3 planar laser extrinsic `x=0.042 m`, `y=0`, `yaw=0`.
-- Use `0.10 s` RGB/scan synchronization slop and `0.25 s` visualization freshness timeout.
+- Use `0.25 s` RGB/scan synchronization slop and `0.25 s` visualization freshness timeout. The synchronization default covers the measured `0.151–0.227 s` laser-header lag relative to RGB.
 - Use a `0.05 m` map resolution over the existing BEV bounds: forward `6 m`, rear `2 m`, lateral `±4 m`.
 - Map semantics are local and explicit: `0=current scan has no hit`, `100=current valid laser hit`.
 - Ignore `0.0`, NaN, Inf, below-minimum, and above-maximum ranges.
@@ -479,7 +479,7 @@ for required in (
     'parser.add_argument("--laser-x", type=float, default=0.042)',
     'parser.add_argument("--laser-y", type=float, default=0.0)',
     'parser.add_argument("--laser-yaw", type=float, default=0.0)',
-    'parser.add_argument("--scan-sync-slop", type=float, default=0.10)',
+    'parser.add_argument("--scan-sync-slop", type=float, default=0.25)',
     'parser.add_argument("--scan-timeout", type=float, default=0.25)',
     'parser.add_argument("--laser-map-resolution", type=float, default=0.05)',
 ):

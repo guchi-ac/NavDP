@@ -223,13 +223,15 @@ MPC RGB BEV 中洋红点表示与 RGB 帧时间最近且仍新鲜的雷达命中
 --laser-x 0.042
 --laser-y 0.0
 --laser-yaw 0.0
---scan-sync-slop 0.10
+--scan-sync-slop 0.25
 --scan-timeout 0.25
 --laser-map-resolution 0.05
 ```
 
-其中 `laser-x/y/yaw` 是已核对的 Mira3 平面激光外参。本版本只记录和显示
-雷达，不改变 NavDP selected、MPC、控制停止条件或 `/cmd_vel`。
+其中 `laser-x/y/yaw` 是已核对的 Mira3 平面激光外参。默认同步窗 `0.25 s`
+覆盖当前驱动实测的雷达与 RGB header 时间偏移，窗口内仍只选择时间最近的一
+帧。本版本只记录和显示雷达，不改变 NavDP selected、MPC、控制停止条件或
+`/cmd_vel`。
 
 客户端持续发布 `/navdp/visualization`，并原子更新：
 
