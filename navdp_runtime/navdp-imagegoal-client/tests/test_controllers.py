@@ -58,16 +58,16 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
             atol=1e-12,
         )
 
-    def test_uses_upstream_default_horizon_and_reference_gap(self):
+    def test_uses_configured_live_default_horizon_and_reference_gap(self):
         controller = Mpc_controller(
             np.array([[0.0, 0.0], [1.0, 0.0]])
         )
 
-        self.assertEqual(controller.N, 15)
+        self.assertEqual(controller.N, 10)
         self.assertEqual(controller.ref_gap, 3)
-        self.assertEqual(controller.ref_traj_len, 6)
-        self.assertEqual(controller.opt_controls.shape, (15, 2))
-        self.assertEqual(controller.opt_states.shape, (16, 3))
+        self.assertEqual(controller.ref_traj_len, 4)
+        self.assertEqual(controller.opt_controls.shape, (10, 2))
+        self.assertEqual(controller.opt_states.shape, (11, 3))
         self.assertFalse(hasattr(controller, "blind_steps"))
         self.assertFalse(hasattr(controller, "prediction_steps"))
 
@@ -123,6 +123,59 @@ class UpstreamNavdpMpcTests(unittest.TestCase):
         np.testing.assert_allclose(controller.ref_traj[-1], [0.0, 2.0])
         self.assertIs(controller.last_opt_u_controls, previous_controls)
         self.assertIs(controller.last_opt_x_states, previous_states)
+
+    def test_update_dense_reference_uses_adjusted_points_without_resampling(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [1.0, 0.0]]),
+            N=3,
+            ref_gap=1,
+        )
+        dense = np.array(
+            [[0.0, 0.0], [0.2, 0.1], [0.4, 0.2], [0.8, 0.2]]
+        )
+        previous_controls = np.full((3, 2), 0.25)
+        previous_states = np.full((4, 3), 0.5)
+        controller.last_opt_u_controls = previous_controls
+        controller.last_opt_x_states = previous_states
+
+        controller.update_dense_ref_traj(dense)
+
+        np.testing.assert_array_equal(controller.ref_traj, dense)
+        self.assertIsNot(controller.ref_traj, dense)
+        self.assertIs(controller.last_opt_u_controls, previous_controls)
+        self.assertIs(controller.last_opt_x_states, previous_states)
+
+    def test_constructor_accepts_an_already_dense_reference(self):
+        dense = np.array(
+            [[0.0, 0.0], [0.2, 0.1], [0.4, 0.2], [0.8, 0.2]]
+        )
+
+        controller = Mpc_controller(
+            dense,
+            N=3,
+            ref_gap=1,
+            ref_traj_is_dense=True,
+        )
+
+        np.testing.assert_array_equal(controller.ref_traj, dense)
+        self.assertIsNot(controller.ref_traj, dense)
+
+    def test_update_dense_reference_rejects_invalid_trajectory(self):
+        controller = Mpc_controller(
+            np.array([[0.0, 0.0], [1.0, 0.0]]),
+            N=3,
+            ref_gap=1,
+        )
+
+        for dense in (
+            np.array([[0.0, 0.0]]),
+            np.array([[0.0, 0.0], [0.0, 0.0]]),
+            np.array([[0.0, 0.0], [np.nan, 0.0]]),
+            np.array([0.0, 1.0]),
+        ):
+            with self.subTest(dense=dense):
+                with self.assertRaises(ValueError):
+                    controller.update_dense_ref_traj(dense)
 
     def test_straight_guide_keeps_angular_velocity_small(self):
         controller = Mpc_controller(

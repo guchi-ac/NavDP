@@ -907,28 +907,40 @@ class RosClientSourceTests(unittest.TestCase):
         )
         return ast.get_source_segment(source, planning)
 
-    def test_control_projection_uses_official_extrinsic_and_live_intrinsic(self):
+    def test_control_uses_laser_adjusted_xy_in_odom_without_reprojection(self):
         planning_source = self.planning_source()
 
-        self.assertIn(
-            "official_base_from_camera = navdp_official_base_from_camera()",
-            planning_source,
-        )
         self.assertIn(
             "algo = navigator_reset(\n"
             "                        snapshot.intrinsic,",
             planning_source,
         )
-        self.assertIn("intrinsic=snapshot.intrinsic", planning_source)
         self.assertIn(
-            "base_from_camera=official_base_from_camera",
+            "raw_selected_world_xy = trajectory_to_world(\n"
+            "                    raw_local_xy,\n"
+            "                    snapshot.odom_xy_yaw,\n"
+            "                )",
             planning_source,
         )
         self.assertIn(
-            "virtual_camera_height=NAVDP_OFFICIAL_CAMERA_HEIGHT_M",
+            "active_traj = normalize_tracking_trajectory(\n"
+            "                        trajectory_to_world(\n"
+            "                            adjusted_local_xy,\n"
+            "                            snapshot.odom_xy_yaw,\n"
+            "                        )\n"
+            "                    )",
             planning_source,
         )
-        self.assertNotIn("snapshot.base_from_camera", planning_source)
+        self.assertIn(
+            "dense_local_xy = Mpc_controller.make_ref_denser(",
+            planning_source,
+        )
+        self.assertIn(
+            "laser_result = prepare_live_laser_trajectory(",
+            planning_source,
+        )
+        self.assertNotIn("reproject_navdp_to_ground_base", planning_source)
+        self.assertNotIn("navdp_official_base_from_camera", planning_source)
 
     def test_selected_and_guide_world_paths_ignore_live_camera_planar_pose(self):
         planning_source = self.planning_source()
@@ -938,13 +950,6 @@ class RosClientSourceTests(unittest.TestCase):
             "                    raw_local_xy,\n"
             "                    snapshot.odom_xy_yaw,\n"
             "                )",
-            planning_source,
-        )
-        self.assertIn(
-            "reprojected_world_xy = trajectory_to_world(\n"
-            "                        reprojected_base_xy,\n"
-            "                        snapshot.odom_xy_yaw,\n"
-            "                    )",
             planning_source,
         )
 
@@ -963,20 +968,20 @@ class RosClientSourceTests(unittest.TestCase):
             render_source,
         )
 
-    def test_client_tracks_reprojected_path_directly_but_snapshots_raw_selected(self):
+    def test_client_tracks_adjusted_path_but_snapshots_raw_selected(self):
         source = self.client_source()
 
         for required in (
-            "reproject_navdp_to_ground_base",
             "raw_selected_world_xy",
-            "reprojected_base_xy",
-            "reprojected_world_xy",
+            "adjusted_local_xy",
             "normalize_tracking_trajectory(\n"
-            "                        reprojected_world_xy\n"
-            "                    )",
+            "                        trajectory_to_world(",
             ".stage(raw_selected_world_xy, True)",
         ):
             self.assertIn(required, source)
+        self.assertNotIn("reproject_navdp_to_ground_base", source)
+        self.assertNotIn("reprojected_base_xy", source)
+        self.assertNotIn("reprojected_world_xy", source)
         self.assertNotIn("TrajectoryManager", source)
         self.assertNotIn("trajectory_manager.update", source)
         self.assertNotIn(
@@ -984,18 +989,17 @@ class RosClientSourceTests(unittest.TestCase):
             source,
         )
 
-    def test_invalid_reprojection_does_not_retain_an_old_trajectory(self):
+    def test_client_has_no_reprojection_failure_state(self):
         source = self.client_source()
 
-        self.assertIn("reprojection_error = None", source)
-        self.assertIn("except ValueError as error:", source)
-        self.assertIn("reprojection_error = str(error)", source)
-        self.assertIn("reprojected_world_xy = None", source)
         self.assertIn("self.installed_active_traj = None", source)
         self.assertIn("self._invalidate_tracking_state()", source)
+        self.assertNotIn("reprojection_error", source)
+        self.assertNotIn("reprojection_status", source)
+        self.assertNotIn("last_reprojection_error_log", source)
         self.assertNotIn("trajectory_manager.update", source)
 
-    def test_client_fixes_official_camera_height_without_runtime_override(self):
+    def test_client_has_no_virtual_camera_control_options(self):
         source = self.client_source()
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -1014,37 +1018,19 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertNotIn("--virtual-camera-height", help_result.stdout)
         self.assertNotIn("args.virtual_camera_height", source)
-        self.assertIn(
-            '"virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M',
-            source,
-        )
+        self.assertNotIn("NAVDP_OFFICIAL_CAMERA_HEIGHT_M", source)
 
-    def test_client_logs_raw_and_reprojected_plan_geometry(self):
+    def test_client_logs_raw_selected_and_active_plan_geometry(self):
         source = self.client_source()
 
         for required in (
             '"raw_selected_world_xy": raw_selected_world_xy',
-            '"reprojected_base_xy": reprojected_base_xy',
-            '"reprojected_world_xy": reprojected_world_xy',
-            '"virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M',
-            '"reprojection_status":',
-            '"reprojection_reason": reprojection_error',
+            '"active_traj": active_traj',
         ):
             self.assertIn(required, source)
-
-    def test_client_distinguishes_unattempted_reprojection_and_throttles_rejections(self):
-        source = self.client_source()
-
-        for required in (
-            'reprojection_status = "not_attempted"',
-            'reprojection_status = "ok"',
-            'reprojection_status = "rejected"',
-            '"reprojection_status": reprojection_status',
-            "self.last_reprojection_error_log = 0.0",
-            "reprojection_log_time - self.last_reprojection_error_log >= 2.0",
-            "self.last_reprojection_error_log = reprojection_log_time",
-        ):
-            self.assertIn(required, source)
+        self.assertNotIn('"reprojected_base_xy"', source)
+        self.assertNotIn('"reprojected_world_xy"', source)
+        self.assertNotIn('"reprojection_status"', source)
 
     def test_client_has_real_robot_inputs_and_explicit_control_gate(self):
         client_path = (
@@ -1354,7 +1340,7 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertNotIn(removed, source)
 
-    def test_client_publishes_mpc_linear_velocity_without_hidden_scaling(self):
+    def test_client_publishes_mpc_linear_velocity_with_live_safety_cap(self):
         client_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -1363,7 +1349,10 @@ class RosClientSourceTests(unittest.TestCase):
         )
         source = client_path.read_text(encoding="utf-8")
 
-        self.assertIn("command.twist.linear.x = linear", source)
+        self.assertIn(
+            "np.clip(linear, 0.0, self.control_max_v)",
+            source,
+        )
         self.assertNotIn("1.5*linear", source)
 
     def test_readme_documents_navdp_only_d435_tf_runtime(self):
@@ -1461,31 +1450,31 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertNotIn("skip_trajectory_points", source)
         self.assertNotIn("--skip-trajectory-points", source)
 
-    def test_client_installs_complete_reprojected_diffusion_in_upstream_mpc(self):
+    def test_client_installs_complete_adjusted_diffusion_in_upstream_mpc(self):
         source = self.client_source()
 
         self.assertIn(
             "active_traj = normalize_tracking_trajectory(\n"
-            "                        reprojected_world_xy",
+            "                        trajectory_to_world(\n"
+            "                            adjusted_local_xy,",
             source,
         )
         self.assertIn("next_mpc = Mpc_controller(", source)
-        self.assertIn("desired_v=self.args.max_v", source)
-        self.assertIn(
-            'parser.add_argument("--max-w", type=float, default=0.50)',
-            source,
-        )
+        self.assertIn("desired_v=self.control_max_v * 0.8", source)
+        self.assertIn("v_max=self.control_max_v", source)
+        self.assertIn("w_max=self.args.max_w", source)
+        self.assertIn("ref_traj_is_dense=True", source)
         self.assertNotIn("TrajectoryManager", source)
         self.assertNotIn("trajectory_update", source)
         self.assertNotIn("blind_steps=", source)
         self.assertNotIn("N=trajectory_update", source)
-        self.assertNotIn("retained_reprojected_world_xy", source)
+        self.assertNotIn("reprojected_world_xy", source)
 
     def test_client_reuses_upstream_mpc_for_valid_plan_updates(self):
         source = self.client_source()
 
         self.assertIn("next_mpc = Mpc_controller(", source)
-        self.assertIn("self.mpc.update_ref_traj(active_traj)", source)
+        self.assertIn("self.mpc.update_dense_ref_traj(active_traj)", source)
         self.assertNotIn("prediction_steps", source)
 
     def test_client_gates_control_on_active_trajectory(self):
@@ -1534,11 +1523,11 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertNotIn("trajectory_join_heading_deg", source)
         self.assertNotIn("trajectory_min_remaining", source)
 
-    def test_client_records_direct_reprojected_active_trajectory(self):
+    def test_client_records_direct_selected_active_trajectory(self):
         source = self.client_source()
 
         for required in (
-            '"reprojected_world_xy": reprojected_world_xy',
+            '"raw_selected_world_xy": raw_selected_world_xy',
             '"active_traj": active_traj',
             '"mpc_horizon": self.mpc.N',
         ):
@@ -1766,7 +1755,7 @@ class RosClientSourceTests(unittest.TestCase):
             )
             or (
                 isinstance(call.func, ast.Attribute)
-                and call.func.attr == "update_ref_traj"
+                and call.func.attr == "update_dense_ref_traj"
             )
         ]
         selected_commit = next(

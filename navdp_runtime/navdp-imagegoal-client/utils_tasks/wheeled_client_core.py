@@ -576,6 +576,8 @@ def control_stop_reason(
     frame_timeout: float,
     odom_timeout: float,
     plan_timeout: float,
+    last_scan_time: Optional[float] = None,
+    scan_timeout: Optional[float] = None,
 ) -> Optional[str]:
     if not enable_control:
         return "control_disabled"
@@ -583,11 +585,14 @@ def control_stop_reason(
         return "arrival"
     if not trajectory_ready:
         return "trajectory_missing"
-    for name, timestamp, timeout in (
+    timestamp_checks = [
         ("frame", last_frame_time, frame_timeout),
         ("odom", last_odom_time, odom_timeout),
         ("plan", last_plan_time, plan_timeout),
-    ):
+    ]
+    if scan_timeout is not None:
+        timestamp_checks.append(("scan", last_scan_time, scan_timeout))
+    for name, timestamp, timeout in timestamp_checks:
         if timestamp is None:
             return f"{name}_missing"
         if now - timestamp > timeout:

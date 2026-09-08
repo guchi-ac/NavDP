@@ -60,6 +60,10 @@ from utils_tasks.laser_obstacle_map import (
     make_laser_scan_snapshot,
     nearest_scan_snapshot,
 )
+from utils_tasks.live_laser_trajectory import (
+    live_test_max_v,
+    prepare_live_laser_trajectory,
+)
 from utils_tasks.rgb_bev_visualizer import (
     BevConfig,
     bev_freshness,
@@ -68,17 +72,14 @@ from utils_tasks.rgb_bev_visualizer import (
 from utils_tasks.rgbd_goal_verifier import RgbdGoalVerifier, VerifierConfig
 from utils_tasks.visualization_utils import VisualizationManager
 from utils_tasks.wheeled_client_core import (
-    NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
     JsonlWriter,
     PostureActionRunner,
     SelectedDiffusionInstallState,
     camera_pose_from_transform,
     control_stop_reason,
     finalize_mp4,
-    navdp_official_base_from_camera,
     normalize_tracking_trajectory,
     put_latest,
-    reproject_navdp_to_ground_base,
     resize_rgbd_for_visualization,
     run_navdp_startup,
     tracking_generation_is_current,
@@ -137,6 +138,7 @@ class NavdpImageGoalClient(Node):
             raise FileNotFoundError(f"cannot read goal image: {args.goal_image}")
 
         self.args = args
+        self.control_max_v = live_test_max_v(args.max_v)
         self.goal_bgr = goal_bgr
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
@@ -227,7 +229,6 @@ class NavdpImageGoalClient(Node):
         self.last_control_log = 0.0
         self.last_control_reason = None
         self.last_tf_error_log = 0.0
-        self.last_reprojection_error_log = 0.0
         self.latest_mpc_visualization = None
         self.visualization_state = None
         self.visualization_queue = queue.Queue(maxsize=1)
@@ -330,7 +331,8 @@ class NavdpImageGoalClient(Node):
         self.get_logger().info(
             "client ready: mode=%s goal=%s cmd=%s camera_tf=%s<-%s "
             "scan=%s laser_frame=%s laser_xy_yaw=(%.3f,%.3f,%.3f) "
-            "video=%s mpc_log=%s max_v=%.2f max_w=%.2f"
+            "video=%s mpc_log=%s requested_max_v=%.2f "
+            "control_max_v=%.2f max_w=%.2f"
             % (
                 mode,
                 args.goal_image,
@@ -345,6 +347,7 @@ class NavdpImageGoalClient(Node):
                 self.visualization_video_output,
                 self.mpc_diagnostics.path,
                 args.max_v,
+                self.control_max_v,
                 args.max_w,
             )
         )
@@ -646,10 +649,18 @@ class NavdpImageGoalClient(Node):
             critic_safe = False
             local_xy = None
             raw_selected_world_xy = None
-            reprojected_base_xy = None
-            reprojected_world_xy = None
-            reprojection_error = None
-            reprojection_status = "not_attempted"
+            adjusted_local_xy = None
+            laser_result = None
+            laser_diagnostic = {
+                "laser_adjustment_reason": "not_run",
+                "laser_adjustment_scan_sequence": None,
+                "laser_adjustment_scan_age_s": None,
+                "laser_adjustment_side": None,
+                "laser_clearance_before_m": None,
+                "laser_clearance_after_m": None,
+                "laser_max_offset_m": None,
+                "adjusted_local_xy": None,
+            }
             trajectory_prefix = np.empty((0, 2), dtype=np.float64)
             candidate_world_xy = np.empty((0, 0, 2), dtype=np.float64)
             candidate_values = np.empty(0, dtype=np.float64)
@@ -730,28 +741,57 @@ class NavdpImageGoalClient(Node):
                 local_xy = raw_local_xy
                 if len(local_xy) < 2 or not np.isfinite(local_xy).all():
                     raise ValueError(f"invalid NavDP trajectory shape: {local_xy.shape}")
-                official_base_from_camera = navdp_official_base_from_camera()
                 raw_selected_world_xy = trajectory_to_world(
                     raw_local_xy,
                     snapshot.odom_xy_yaw,
                 )
-                try:
-                    reprojected_base_xy = reproject_navdp_to_ground_base(
-                        local_xy=raw_local_xy,
-                        intrinsic=snapshot.intrinsic,
-                        image_height=snapshot.rgb_bgr.shape[0],
-                        base_from_camera=official_base_from_camera,
-                        virtual_camera_height=NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
-                    )
-                    reprojected_world_xy = trajectory_to_world(
-                        reprojected_base_xy,
-                        snapshot.odom_xy_yaw,
-                    )
-                    reprojection_status = "ok"
-                except ValueError as error:
-                    reprojection_error = str(error)
-                    reprojection_status = "rejected"
-                    reprojected_world_xy = None
+                dense_local_xy = Mpc_controller.make_ref_denser(
+                    None,
+                    raw_local_xy,
+                )
+                with self.data_lock:
+                    latest_scan = self.latest_scan
+                laser_result = prepare_live_laser_trajectory(
+                    dense_xy=dense_local_xy,
+                    scan=latest_scan,
+                    plan_odom_xy_yaw=snapshot.odom_xy_yaw,
+                    now_monotonic=time.monotonic(),
+                    timeout_s=self.args.scan_timeout,
+                    laser_config=self.laser_map_config,
+                )
+                adjustment = laser_result.adjustment
+                laser_diagnostic.update(
+                    {
+                        "laser_adjustment_reason": laser_result.reason,
+                        "laser_adjustment_scan_sequence": (
+                            laser_result.scan_sequence
+                        ),
+                        "laser_adjustment_scan_age_s": (
+                            laser_result.scan_age_s
+                        ),
+                        "laser_adjustment_side": (
+                            None if adjustment is None else adjustment.side
+                        ),
+                        "laser_clearance_before_m": (
+                            None
+                            if adjustment is None
+                            else adjustment.min_clearance_before_m
+                        ),
+                        "laser_clearance_after_m": (
+                            None
+                            if adjustment is None
+                            else adjustment.min_clearance_after_m
+                        ),
+                        "laser_max_offset_m": (
+                            None
+                            if adjustment is None
+                            else adjustment.max_offset_m
+                        ),
+                        "adjusted_local_xy": (
+                            laser_result.trajectory_local_xy
+                        ),
+                    }
+                )
                 candidate_world_xy = np.asarray(
                     [
                         trajectory_to_world(
@@ -764,12 +804,13 @@ class NavdpImageGoalClient(Node):
                         for candidate in candidate_local
                     ]
                 )
-                if (
-                    reprojected_world_xy is not None
-                    and critic_safe
-                ):
+                if critic_safe and laser_result.safe:
+                    adjusted_local_xy = laser_result.trajectory_local_xy
                     active_traj = normalize_tracking_trajectory(
-                        reprojected_world_xy
+                        trajectory_to_world(
+                            adjusted_local_xy,
+                            snapshot.odom_xy_yaw,
+                        )
                     )
                 self.visualization_state = VisualizationState(
                     trajectory=(
@@ -784,16 +825,6 @@ class NavdpImageGoalClient(Node):
                     arrived=False,
                 )
                 self._queue_visualization(snapshot)
-                if reprojection_error is not None:
-                    reprojection_log_time = time.monotonic()
-                    if (
-                        reprojection_log_time - self.last_reprojection_error_log >= 2.0
-                    ):
-                        self.get_logger().warning(
-                            "NavDP virtual reprojection rejected: %s"
-                            % reprojection_error
-                        )
-                        self.last_reprojection_error_log = reprojection_log_time
                 if not critic_safe:
                     self.get_logger().warning(
                         "NavDP candidate below critic threshold: "
@@ -802,6 +833,11 @@ class NavdpImageGoalClient(Node):
                             critic_max,
                             self.args.critic_threshold,
                         )
+                    )
+                elif not laser_result.safe:
+                    self.get_logger().warning(
+                        "Laser trajectory adjustment rejected plan: "
+                        f"reason={laser_result.reason}"
                     )
             except Exception as error:
                 planning_error = error
@@ -821,12 +857,8 @@ class NavdpImageGoalClient(Node):
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
                         "raw_selected_world_xy": raw_selected_world_xy,
-                        "reprojected_base_xy": reprojected_base_xy,
-                        "reprojected_world_xy": reprojected_world_xy,
-                        "virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
-                        "reprojection_status": reprojection_status,
-                        "reprojection_reason": reprojection_error,
                         "active_traj": None,
+                        **laser_diagnostic,
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
                         ),
@@ -845,13 +877,14 @@ class NavdpImageGoalClient(Node):
                         if self.mpc is None:
                             next_mpc = Mpc_controller(
                                 active_traj,
-                                desired_v=self.args.max_v,
-                                v_max=self.args.max_v,
+                                desired_v=self.control_max_v * 0.8,
+                                v_max=self.control_max_v,
                                 w_max=self.args.max_w,
+                                ref_traj_is_dense=True,
                             )
                             self.mpc = next_mpc
                         else:
-                            self.mpc.update_ref_traj(active_traj)
+                            self.mpc.update_dense_ref_traj(active_traj)
                         next_selected_state = (
                             SelectedDiffusionInstallState()
                             .stage(raw_selected_world_xy, True)
@@ -902,12 +935,8 @@ class NavdpImageGoalClient(Node):
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
                         "raw_selected_world_xy": raw_selected_world_xy,
-                        "reprojected_base_xy": reprojected_base_xy,
-                        "reprojected_world_xy": reprojected_world_xy,
-                        "virtual_camera_height_m": NAVDP_OFFICIAL_CAMERA_HEIGHT_M,
-                        "reprojection_status": reprojection_status,
-                        "reprojection_reason": reprojection_error,
                         "active_traj": active_traj,
+                        **laser_diagnostic,
                         "mpc_horizon": self.mpc.N,
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
@@ -921,10 +950,15 @@ class NavdpImageGoalClient(Node):
                 )
                 self.get_logger().info(
                     "installed upstream NavDP trajectory: "
-                    "points=%d mpc_horizon=%d"
+                    "points=%d mpc_horizon=%d laser_side=%s "
+                    "clearance=%.3f->%.3f max_offset=%.3f"
                     % (
                         len(active_traj),
                         self.mpc.N,
+                        laser_result.adjustment.side,
+                        laser_result.adjustment.min_clearance_before_m,
+                        laser_result.adjustment.min_clearance_after_m,
+                        laser_result.adjustment.max_offset_m,
                     )
                 )
 
@@ -1056,12 +1090,13 @@ class NavdpImageGoalClient(Node):
                 else self.latest_odom_twist.copy()
             )
             mpc_snapshot = self.latest_mpc_visualization
+            latest_scan = self.latest_scan
 
         now = time.monotonic()
         try:
             laser_obstacle_xy, laser_status, laser_age_s = (
                 laser_bev_obstacles(
-                    snapshot.laser_snapshot,
+                    latest_scan,
                     target_odom_xy_yaw=frame_odom,
                     now_monotonic=now,
                     timeout_s=self.args.scan_timeout,
@@ -1073,8 +1108,8 @@ class NavdpImageGoalClient(Node):
             laser_status = "LASER ERROR"
             laser_age_s = (
                 None
-                if snapshot.laser_snapshot is None
-                else now - snapshot.laser_snapshot.received_at
+                if latest_scan is None
+                else now - latest_scan.received_at
             )
             if now - self.last_laser_map_error_log >= 2.0:
                 self.get_logger().error(f"laser map rendering failed: {error}")
@@ -1197,6 +1232,12 @@ class NavdpImageGoalClient(Node):
                     frame_timeout=self.args.frame_timeout,
                     odom_timeout=self.args.odom_timeout,
                     plan_timeout=self.args.plan_timeout,
+                    last_scan_time=(
+                        None
+                        if latest_scan is None
+                        else latest_scan.received_at
+                    ),
+                    scan_timeout=self.args.scan_timeout,
                 )
                 if (
                     reason is None
@@ -1246,7 +1287,11 @@ class NavdpImageGoalClient(Node):
                             if selected_diffusion_snapshot is not None:
                                 selected_diffusion_snapshot.setflags(write=False)
                             proposed_linear = float(
-                                np.clip(controls[0, 0], 0.0, self.args.max_v)
+                                np.clip(
+                                    controls[0, 0],
+                                    0.0,
+                                    self.control_max_v,
+                                )
                             )
                             proposed_angular = float(
                                 np.clip(
@@ -1358,8 +1403,12 @@ class NavdpImageGoalClient(Node):
         command = TwistStamped()
         command.header.stamp = self.get_clock().now().to_msg()
         command.header.frame_id = self.args.base_frame
-        command.twist.linear.x = linear
-        command.twist.angular.z = angular
+        command.twist.linear.x = float(
+            np.clip(linear, 0.0, self.control_max_v)
+        )
+        command.twist.angular.z = float(
+            np.clip(angular, -self.args.max_w, self.args.max_w)
+        )
         self.control_pub.publish(command)
 
     def stop(self) -> None:
@@ -1479,8 +1528,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scan-timeout", type=float, default=0.25)
     parser.add_argument("--laser-map-resolution", type=float, default=0.05)
     parser.add_argument("--plan-period", type=float, default=0.3)
-    parser.add_argument("--max-v", type=float, default=0.15)
-    parser.add_argument("--max-w", type=float, default=0.50)
+    parser.add_argument("--max-v", type=float, default=0.1)
+    parser.add_argument("--max-w", type=float, default=0.20)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
     parser.add_argument("--arrival-distance", type=float, default=0.5)
     parser.add_argument("--arrival-consecutive", type=int, default=3)

@@ -40,17 +40,22 @@ class Mpc_controller:
     def __init__(
         self,
         global_planed_traj,
-        N=15,
+        N=10,
         desired_v=0.5,
         v_max=0.5,
         w_max=0.5,
         ref_gap=3,
+        ref_traj_is_dense=False,
     ):
         self.N = N
         self.desired_v = desired_v
         self.ref_gap = ref_gap
         self.T = 0.1
-        self.ref_traj = self.make_ref_denser(global_planed_traj)
+        self.ref_traj = (
+            self._copy_valid_dense_ref_traj(global_planed_traj)
+            if ref_traj_is_dense
+            else self.make_ref_denser(global_planed_traj)
+        )
         self.ref_traj_len = N // ref_gap + 1
 
         opti = ca.Opti()
@@ -153,6 +158,34 @@ class Mpc_controller:
     def update_ref_traj(self, global_planed_traj):
         dense_ref_traj = self.make_ref_denser(global_planed_traj)
         self.ref_traj = dense_ref_traj
+        self.ref_traj_len = self.N // self.ref_gap + 1
+
+    @staticmethod
+    def _copy_valid_dense_ref_traj(dense_ref_traj):
+        dense_ref_traj = np.asarray(dense_ref_traj, dtype=np.float64)
+        if (
+            dense_ref_traj.ndim != 2
+            or dense_ref_traj.shape[1] != 2
+            or len(dense_ref_traj) < 2
+            or not np.isfinite(dense_ref_traj).all()
+        ):
+            raise ValueError(
+                "dense_ref_traj must be finite with shape (N, 2), N >= 2"
+            )
+        if not np.any(
+            np.linalg.norm(
+                dense_ref_traj - dense_ref_traj[0],
+                axis=1,
+            )
+            > np.finfo(np.float64).eps
+        ):
+            raise ValueError(
+                "dense_ref_traj must contain two distinct points"
+            )
+        return dense_ref_traj.copy()
+
+    def update_dense_ref_traj(self, dense_ref_traj):
+        self.ref_traj = self._copy_valid_dense_ref_traj(dense_ref_traj)
         self.ref_traj_len = self.N // self.ref_gap + 1
 
     def solve(self, x0):
