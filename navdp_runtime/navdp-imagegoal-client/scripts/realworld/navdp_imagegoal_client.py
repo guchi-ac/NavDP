@@ -33,7 +33,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time as RosTime
 from rclpy.utilities import remove_ros_args
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from tf2_ros import (
     Buffer,
     StaticTransformBroadcaster,
@@ -49,6 +49,21 @@ for import_path in (REPO_ROOT, SCRIPT_DIR):
 
 from controllers import Mpc_controller
 from utils_tasks.client_utils import imagegoal_step, navigator_close, navigator_reset
+from utils_tasks.laser_obstacle_map import (
+    DEFAULT_SCAN_SYNC_SLOP_S,
+    MIRA3_LASER_YAW_RAD,
+    LaserMapConfig,
+    LaserScanSnapshot,
+    laser_bev_obstacles,
+    laser_scan_association,
+    laser_scan_record,
+    make_laser_scan_snapshot,
+    nearest_scan_snapshot,
+)
+from utils_tasks.live_laser_trajectory import (
+    live_test_max_v,
+    prepare_live_laser_trajectory,
+)
 from utils_tasks.rgb_bev_visualizer import (
     BevConfig,
     bev_freshness,
@@ -60,13 +75,14 @@ from utils_tasks.wheeled_client_core import (
     JsonlWriter,
     PostureActionRunner,
     SelectedDiffusionInstallState,
-    TrajectoryManager,
     camera_pose_from_transform,
     control_stop_reason,
     finalize_mp4,
+    normalize_tracking_trajectory,
     put_latest,
     resize_rgbd_for_visualization,
     run_navdp_startup,
+    tracking_generation_is_current,
     trajectory_to_world,
     transform_matrix_from_translation_quaternion,
     yaw_from_quaternion,
@@ -76,6 +92,7 @@ from utils_tasks.wheeled_client_core import (
 @dataclass
 class FrameSnapshot:
     sequence: int
+    stamp_ns: int
     rgb_bgr: np.ndarray
     depth_m: np.ndarray
     intrinsic: np.ndarray
@@ -83,6 +100,8 @@ class FrameSnapshot:
     camera_xy_yaw: np.ndarray
     base_from_camera: np.ndarray
     received_at: float
+    laser_snapshot: Optional[LaserScanSnapshot]
+    scan_rgb_dt_s: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -119,6 +138,7 @@ class NavdpImageGoalClient(Node):
             raise FileNotFoundError(f"cannot read goal image: {args.goal_image}")
 
         self.args = args
+        self.control_max_v = live_test_max_v(args.max_v)
         self.goal_bgr = goal_bgr
         self.bridge = CvBridge()
         self.tf_buffer = Buffer()
@@ -143,6 +163,30 @@ class NavdpImageGoalClient(Node):
         self.mpc_bev_video_writer = None
         self.mpc_bev_video_failed = False
         self.bev_config = BevConfig(sample_stride=args.bev_sample_stride)
+        for name in (
+            "laser_x",
+            "laser_y",
+            "laser_yaw",
+            "scan_sync_slop",
+            "scan_timeout",
+            "laser_map_resolution",
+        ):
+            if not np.isfinite(getattr(args, name)):
+                raise ValueError(f"{name} must be finite")
+        if args.scan_sync_slop < 0.0:
+            raise ValueError("scan_sync_slop must be non-negative")
+        if args.scan_timeout <= 0.0:
+            raise ValueError("scan_timeout must be positive")
+        if args.laser_map_resolution <= 0.0:
+            raise ValueError("laser_map_resolution must be positive")
+        if not args.laser_frame:
+            raise ValueError("laser_frame must be non-empty")
+        self.laser_map_config = LaserMapConfig(
+            resolution_m=args.laser_map_resolution,
+            laser_x_m=args.laser_x,
+            laser_y_m=args.laser_y,
+            laser_yaw_rad=args.laser_yaw,
+        )
         mpc_log_dir = Path(args.mpc_log_dir).expanduser()
         self.mpc_diagnostics = JsonlWriter(
             mpc_log_dir / f"{run_stamp}_mpc.jsonl"
@@ -157,12 +201,6 @@ class NavdpImageGoalClient(Node):
                 required_consecutive=args.arrival_consecutive,
             ),
         )
-        self.trajectory_manager = TrajectoryManager(
-            point_spacing=args.trajectory_point_spacing,
-            join_distance=args.trajectory_join_distance,
-            join_heading_degrees=args.trajectory_join_heading_deg,
-            min_remaining=args.trajectory_min_remaining,
-        )
         self.data_lock = threading.Lock()
         self.mpc_lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -173,6 +211,11 @@ class NavdpImageGoalClient(Node):
         self.odom_history = deque(maxlen=600)
         self.latest_frame = None
         self.frame_sequence = 0
+        self.latest_scan: Optional[LaserScanSnapshot] = None
+        self.recent_scans = deque(maxlen=50)
+        self.scan_sequence = 0
+        self.last_scan_error_log = 0.0
+        self.last_laser_map_error_log = 0.0
         self.mpc = None
         self.installed_active_traj: Optional[np.ndarray] = None
         self.selected_diffusion_state = SelectedDiffusionInstallState()
@@ -181,6 +224,7 @@ class NavdpImageGoalClient(Node):
         self.latest_plan_id = None
         self.arrival_blocked = False
         self.trajectory_ready = False
+        self.trajectory_generation = 0
         self.server_initialized = False
         self.last_control_log = 0.0
         self.last_control_reason = None
@@ -202,6 +246,12 @@ class NavdpImageGoalClient(Node):
             args.odom_topic,
             self._odom_callback,
             10,
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            args.scan_topic,
+            self._scan_callback,
+            qos_profile_sensor_data,
         )
         self.rgb_sub = message_filters.Subscriber(
             self,
@@ -279,16 +329,25 @@ class NavdpImageGoalClient(Node):
         args = self.args
         mode = "ENABLED" if args.enable_control else "DRY-RUN"
         self.get_logger().info(
-            "client ready: mode=%s goal=%s cmd=%s camera_tf=%s<-%s video=%s mpc_log=%s max_v=%.2f max_w=%.2f"
+            "client ready: mode=%s goal=%s cmd=%s camera_tf=%s<-%s "
+            "scan=%s laser_frame=%s laser_xy_yaw=(%.3f,%.3f,%.3f) "
+            "video=%s mpc_log=%s requested_max_v=%.2f "
+            "control_max_v=%.2f max_w=%.2f"
             % (
                 mode,
                 args.goal_image,
                 args.cmd_topic,
                 args.base_frame,
                 args.camera_frame,
+                args.scan_topic,
+                args.laser_frame,
+                args.laser_x,
+                args.laser_y,
+                args.laser_yaw,
                 self.visualization_video_output,
                 self.mpc_diagnostics.path,
                 args.max_v,
+                self.control_max_v,
                 args.max_w,
             )
         )
@@ -406,6 +465,47 @@ class NavdpImageGoalClient(Node):
             self.last_odom_time = time.monotonic()
             self.odom_history.append(pose.copy())
 
+    def _scan_callback(self, message: LaserScan) -> None:
+        received_at = time.monotonic()
+        try:
+            if message.header.frame_id != self.args.laser_frame:
+                raise ValueError(
+                    "unexpected laser frame %r, expected %r"
+                    % (message.header.frame_id, self.args.laser_frame)
+                )
+            stamp_ns = (
+                int(message.header.stamp.sec) * 1_000_000_000
+                + int(message.header.stamp.nanosec)
+            )
+            with self.data_lock:
+                next_sequence = self.scan_sequence + 1
+                snapshot = make_laser_scan_snapshot(
+                    sequence=next_sequence,
+                    stamp_ns=stamp_ns,
+                    received_at=received_at,
+                    frame_id=message.header.frame_id,
+                    angle_min=message.angle_min,
+                    angle_increment=message.angle_increment,
+                    range_min=message.range_min,
+                    range_max=message.range_max,
+                    ranges=np.asarray(message.ranges, dtype=np.float32),
+                    odom_xy_yaw=(
+                        None
+                        if self.latest_odom is None
+                        else self.latest_odom.copy()
+                    ),
+                )
+                self.scan_sequence = next_sequence
+                self.latest_scan = snapshot
+                self.recent_scans.append(snapshot)
+            self._write_diagnostic(
+                laser_scan_record(snapshot, wall_time=time.time())
+            )
+        except Exception as error:
+            if received_at - self.last_scan_error_log >= 2.0:
+                self.get_logger().error(f"laser scan rejected: {error}")
+                self.last_scan_error_log = received_at
+
     def _write_diagnostic(self, record: dict) -> None:
         if self.mpc_diagnostics_failed:
             return
@@ -414,6 +514,18 @@ class NavdpImageGoalClient(Node):
         except Exception as error:
             self.mpc_diagnostics_failed = True
             self.get_logger().error(f"MPC diagnostic logging disabled: {error}")
+
+    def _invalidate_tracking_state(self) -> None:
+        with self.data_lock:
+            self.trajectory_generation += 1
+            self.trajectory_ready = False
+            self.latest_mpc_visualization = None
+        with self.mpc_lock:
+            self.selected_diffusion_state = (
+                self.selected_diffusion_state.clear()
+            )
+            self.mpc = None
+            self.installed_active_traj = None
 
     def _publish_d435_mount_transform(self) -> None:
         transform = TransformStamped()
@@ -461,6 +573,10 @@ class NavdpImageGoalClient(Node):
 
     def _rgbd_callback(self, rgb_message: Image, depth_message: Image) -> None:
         try:
+            rgb_stamp_ns = (
+                int(rgb_message.header.stamp.sec) * 1_000_000_000
+                + int(rgb_message.header.stamp.nanosec)
+            )
             rgb_bgr = self.bridge.imgmsg_to_cv2(rgb_message, desired_encoding="bgr8")
             depth = np.asarray(
                 self.bridge.imgmsg_to_cv2(depth_message, desired_encoding="passthrough")
@@ -491,9 +607,15 @@ class NavdpImageGoalClient(Node):
             with self.data_lock:
                 if self.intrinsic is None:
                     return
+                laser_snapshot, scan_rgb_dt_s = nearest_scan_snapshot(
+                    self.recent_scans,
+                    rgb_stamp_ns,
+                    self.args.scan_sync_slop,
+                )
                 self.frame_sequence += 1
                 snapshot = FrameSnapshot(
                     sequence=self.frame_sequence,
+                    stamp_ns=rgb_stamp_ns,
                     rgb_bgr=np.asarray(rgb_bgr).copy(),
                     depth_m=depth_m.copy(),
                     intrinsic=self.intrinsic.copy(),
@@ -503,6 +625,8 @@ class NavdpImageGoalClient(Node):
                     camera_xy_yaw=camera_xy_yaw,
                     base_from_camera=base_from_camera.copy(),
                     received_at=time.monotonic(),
+                    laser_snapshot=laser_snapshot,
+                    scan_rgb_dt_s=scan_rgb_dt_s,
                 )
                 self.latest_frame = snapshot
             self._queue_visualization(snapshot)
@@ -520,11 +644,23 @@ class NavdpImageGoalClient(Node):
                 continue
             last_sequence = snapshot.sequence
 
-            trajectory_update = None
+            active_traj = None
             critic_max = None
             critic_safe = False
             local_xy = None
-            retained_world_xy = None
+            raw_selected_world_xy = None
+            adjusted_local_xy = None
+            laser_result = None
+            laser_diagnostic = {
+                "laser_adjustment_reason": "not_run",
+                "laser_adjustment_scan_sequence": None,
+                "laser_adjustment_scan_age_s": None,
+                "laser_adjustment_side": None,
+                "laser_clearance_before_m": None,
+                "laser_clearance_after_m": None,
+                "laser_max_offset_m": None,
+                "adjusted_local_xy": None,
+            }
             trajectory_prefix = np.empty((0, 2), dtype=np.float64)
             candidate_world_xy = np.empty((0, 0, 2), dtype=np.float64)
             candidate_values = np.empty(0, dtype=np.float64)
@@ -532,9 +668,6 @@ class NavdpImageGoalClient(Node):
             try:
                 if snapshot.odom_xy_yaw is None:
                     raise RuntimeError("no odometry snapshot for planned frame")
-                trajectory_update = self.trajectory_manager.update(
-                    snapshot.odom_xy_yaw[:2]
-                )
                 arrival = self.verifier.update(
                     snapshot.rgb_bgr,
                     snapshot.depth_m,
@@ -605,25 +738,59 @@ class NavdpImageGoalClient(Node):
                 if raw_local_xy.ndim == 3:
                     raw_local_xy = raw_local_xy[0]
                 raw_local_xy = raw_local_xy[:, :2]
-                local_xy = raw_local_xy[self.args.skip_trajectory_points :]
+                local_xy = raw_local_xy
                 if len(local_xy) < 2 or not np.isfinite(local_xy).all():
                     raise ValueError(f"invalid NavDP trajectory shape: {local_xy.shape}")
-                raw_world_xy = trajectory_to_world(
+                raw_selected_world_xy = trajectory_to_world(
                     raw_local_xy,
                     snapshot.odom_xy_yaw,
-                    camera_x=snapshot.camera_xy_yaw[0],
-                    camera_y=snapshot.camera_xy_yaw[1],
-                    camera_yaw=snapshot.camera_xy_yaw[2],
                 )
-                retained_world_xy = raw_world_xy[
-                    self.args.skip_trajectory_points :
-                ]
-                prefix_end = self.args.skip_trajectory_points
-                trajectory_prefix = np.vstack(
-                    (
-                        snapshot.odom_xy_yaw[:2],
-                        raw_world_xy[:prefix_end],
-                    )
+                dense_local_xy = Mpc_controller.make_ref_denser(
+                    None,
+                    raw_local_xy,
+                )
+                with self.data_lock:
+                    latest_scan = self.latest_scan
+                laser_result = prepare_live_laser_trajectory(
+                    dense_xy=dense_local_xy,
+                    scan=latest_scan,
+                    plan_odom_xy_yaw=snapshot.odom_xy_yaw,
+                    now_monotonic=time.monotonic(),
+                    timeout_s=self.args.scan_timeout,
+                    laser_config=self.laser_map_config,
+                )
+                adjustment = laser_result.adjustment
+                laser_diagnostic.update(
+                    {
+                        "laser_adjustment_reason": laser_result.reason,
+                        "laser_adjustment_scan_sequence": (
+                            laser_result.scan_sequence
+                        ),
+                        "laser_adjustment_scan_age_s": (
+                            laser_result.scan_age_s
+                        ),
+                        "laser_adjustment_side": (
+                            None if adjustment is None else adjustment.side
+                        ),
+                        "laser_clearance_before_m": (
+                            None
+                            if adjustment is None
+                            else adjustment.min_clearance_before_m
+                        ),
+                        "laser_clearance_after_m": (
+                            None
+                            if adjustment is None
+                            else adjustment.min_clearance_after_m
+                        ),
+                        "laser_max_offset_m": (
+                            None
+                            if adjustment is None
+                            else adjustment.max_offset_m
+                        ),
+                        "adjusted_local_xy": (
+                            laser_result.trajectory_local_xy
+                        ),
+                    }
                 )
                 candidate_world_xy = np.asarray(
                     [
@@ -637,12 +804,14 @@ class NavdpImageGoalClient(Node):
                         for candidate in candidate_local
                     ]
                 )
-                trajectory_update = self.trajectory_manager.update(
-                    snapshot.odom_xy_yaw[:2],
-                    retained_world_xy,
-                    candidate_eligible=critic_safe,
-                )
-                active_traj = trajectory_update.active_traj
+                if critic_safe and laser_result.safe:
+                    adjusted_local_xy = laser_result.trajectory_local_xy
+                    active_traj = normalize_tracking_trajectory(
+                        trajectory_to_world(
+                            adjusted_local_xy,
+                            snapshot.odom_xy_yaw,
+                        )
+                    )
                 self.visualization_state = VisualizationState(
                     trajectory=(
                         np.empty((0, 2), dtype=np.float64)
@@ -659,72 +828,80 @@ class NavdpImageGoalClient(Node):
                 if not critic_safe:
                     self.get_logger().warning(
                         "NavDP candidate below critic threshold: "
-                        "max=%.3f threshold=%.3f active=%s"
+                        "max=%.3f threshold=%.3f"
                         % (
                             critic_max,
                             self.args.critic_threshold,
-                            "retained"
-                            if active_traj is not None
-                            else "unavailable",
                         )
+                    )
+                elif not laser_result.safe:
+                    self.get_logger().warning(
+                        "Laser trajectory adjustment rejected plan: "
+                        f"reason={laser_result.reason}"
                     )
             except Exception as error:
                 planning_error = error
                 self.get_logger().error(f"planning failed: {error}")
 
-            active_traj = (
-                None
-                if trajectory_update is None
-                else trajectory_update.active_traj
-            )
             if active_traj is None:
-                with self.mpc_lock:
-                    self.selected_diffusion_state = (
-                        self.selected_diffusion_state.clear()
-                    )
-                with self.data_lock:
-                    self.trajectory_ready = False
-                if trajectory_update is not None:
-                    self.get_logger().warning(
-                        "trajectory unavailable: reason=%s"
-                        % trajectory_update.reason
-                    )
+                self._invalidate_tracking_state()
+                diagnostic_time = time.monotonic()
+                self._write_diagnostic(
+                    {
+                        "type": "plan",
+                        "wall_time": time.time(),
+                        "monotonic_time": diagnostic_time,
+                        "frame_sequence": snapshot.sequence,
+                        "critic": critic_max,
+                        "snapshot_odom": snapshot.odom_xy_yaw,
+                        "camera_pose": snapshot.camera_xy_yaw,
+                        "selected_local_xy": local_xy,
+                        "raw_selected_world_xy": raw_selected_world_xy,
+                        "active_traj": None,
+                        **laser_diagnostic,
+                        "planning_error": (
+                            None if planning_error is None else str(planning_error)
+                        ),
+                        **laser_scan_association(
+                            snapshot.laser_snapshot,
+                            scan_rgb_dt_s=snapshot.scan_rgb_dt_s,
+                            now_monotonic=diagnostic_time,
+                        ),
+                    }
+                )
             else:
                 try:
+                    next_active_traj = np.asarray(active_traj).copy()
+                    next_active_traj.setflags(write=False)
                     with self.mpc_lock:
-                        self.selected_diffusion_state = (
-                            self.selected_diffusion_state.stage(
-                                retained_world_xy,
-                                trajectory_update.candidate_accepted,
-                            )
-                        )
-                        if (
-                            self.mpc is None
-                            or self.mpc.prediction_steps
-                            != trajectory_update.mpc_prediction_steps
-                        ):
-                            self.mpc = Mpc_controller(
+                        if self.mpc is None:
+                            next_mpc = Mpc_controller(
                                 active_traj,
-                                N=trajectory_update.diffusion_point_count,
-                                blind_steps=trajectory_update.blind_point_count,
-                                desired_v=self.args.max_v,
-                                v_max=self.args.max_v,
+                                desired_v=self.control_max_v * 0.8,
+                                v_max=self.control_max_v,
                                 w_max=self.args.max_w,
+                                ref_traj_is_dense=True,
                             )
+                            self.mpc = next_mpc
                         else:
-                            self.mpc.update_ref_traj(
-                                active_traj,
-                                N=trajectory_update.diffusion_point_count,
-                                blind_steps=trajectory_update.blind_point_count,
-                            )
-                        self.installed_active_traj = np.asarray(active_traj).copy()
-                        self.installed_active_traj.setflags(write=False)
-                        self.selected_diffusion_state = (
-                            self.selected_diffusion_state.commit()
+                            self.mpc.update_dense_ref_traj(active_traj)
+                        next_selected_state = (
+                            SelectedDiffusionInstallState()
+                            .stage(raw_selected_world_xy, True)
+                            .commit()
                         )
+                        self.installed_active_traj = next_active_traj
+                        self.selected_diffusion_state = next_selected_state
+                        with self.data_lock:
+                            plan_ready = time.monotonic()
+                            self.trajectory_generation += 1
+                            self.trajectory_ready = True
+                            self.last_plan_time = plan_ready
+                            self.plan_sequence += 1
+                            self.latest_plan_id = self.plan_sequence
+                            plan_id = self.latest_plan_id
                 except Exception as error:
-                    with self.data_lock:
-                        self.trajectory_ready = False
+                    self._invalidate_tracking_state()
                     reason = "active_trajectory_error"
                     self.get_logger().error(
                         f"failed to install active trajectory: {error}"
@@ -734,13 +911,6 @@ class NavdpImageGoalClient(Node):
                         max(0.0, self.args.plan_period - elapsed)
                     )
                     continue
-                with self.data_lock:
-                    plan_ready = time.monotonic()
-                    self.trajectory_ready = True
-                    self.last_plan_time = plan_ready
-                    self.plan_sequence += 1
-                    self.latest_plan_id = self.plan_sequence
-                    plan_id = self.latest_plan_id
                 if planning_error is not None and self.visualization_state is not None:
                     state = self.visualization_state
                     self.visualization_state = VisualizationState(
@@ -764,59 +934,31 @@ class NavdpImageGoalClient(Node):
                         "snapshot_odom": snapshot.odom_xy_yaw,
                         "camera_pose": snapshot.camera_xy_yaw,
                         "selected_local_xy": local_xy,
-                        "navdp_world_xy": retained_world_xy,
-                        "candidate_world_xy": retained_world_xy,
+                        "raw_selected_world_xy": raw_selected_world_xy,
                         "active_traj": active_traj,
-                        "candidate_accepted": trajectory_update.candidate_accepted,
-                        "trajectory_reason": trajectory_update.reason,
-                        "trajectory_join_distance_m": (
-                            trajectory_update.join_distance_m
-                        ),
-                        "trajectory_remaining_length_m": (
-                            trajectory_update.remaining_length_m
-                        ),
-                        "trajectory_blind_length_m": (
-                            trajectory_update.blind_length_m
-                        ),
-                        "trajectory_blind_point_count": (
-                            trajectory_update.blind_point_count
-                        ),
-                        "trajectory_diffusion_length_m": (
-                            trajectory_update.diffusion_length_m
-                        ),
-                        "trajectory_diffusion_point_count": (
-                            trajectory_update.diffusion_point_count
-                        ),
-                        "mpc_prediction_steps": (
-                            trajectory_update.mpc_prediction_steps
-                        ),
-                        "trajectory_manager_update_ms": (
-                            trajectory_update.manager_update_ms
-                        ),
+                        **laser_diagnostic,
+                        "mpc_horizon": self.mpc.N,
                         "planning_error": (
                             None if planning_error is None else str(planning_error)
+                        ),
+                        **laser_scan_association(
+                            snapshot.laser_snapshot,
+                            scan_rgb_dt_s=snapshot.scan_rgb_dt_s,
+                            now_monotonic=plan_ready,
                         ),
                     }
                 )
                 self.get_logger().info(
-                    "active trajectory: reason=%s accepted=%s points=%d "
-                    "remaining=%.3f blind=%.3f blind_points=%d "
-                    "diffusion=%.3f diffusion_points=%d mpc_steps=%d "
-                    "join=%s manager_ms=%.3f"
+                    "installed upstream NavDP trajectory: "
+                    "points=%d mpc_horizon=%d laser_side=%s "
+                    "clearance=%.3f->%.3f max_offset=%.3f"
                     % (
-                        trajectory_update.reason,
-                        trajectory_update.candidate_accepted,
                         len(active_traj),
-                        trajectory_update.remaining_length_m,
-                        trajectory_update.blind_length_m,
-                        trajectory_update.blind_point_count,
-                        trajectory_update.diffusion_length_m,
-                        trajectory_update.diffusion_point_count,
-                        trajectory_update.mpc_prediction_steps,
-                        "nan"
-                        if trajectory_update.join_distance_m is None
-                        else f"{trajectory_update.join_distance_m:.3f}",
-                        trajectory_update.manager_update_ms,
+                        self.mpc.N,
+                        laser_result.adjustment.side,
+                        laser_result.adjustment.min_clearance_before_m,
+                        laser_result.adjustment.min_clearance_after_m,
+                        laser_result.adjustment.max_offset_m,
                     )
                 )
 
@@ -948,8 +1090,30 @@ class NavdpImageGoalClient(Node):
                 else self.latest_odom_twist.copy()
             )
             mpc_snapshot = self.latest_mpc_visualization
+            latest_scan = self.latest_scan
 
         now = time.monotonic()
+        try:
+            laser_obstacle_xy, laser_status, laser_age_s = (
+                laser_bev_obstacles(
+                    latest_scan,
+                    target_odom_xy_yaw=frame_odom,
+                    now_monotonic=now,
+                    timeout_s=self.args.scan_timeout,
+                    config=self.laser_map_config,
+                )
+            )
+        except Exception as error:
+            laser_obstacle_xy = None
+            laser_status = "LASER ERROR"
+            laser_age_s = (
+                None
+                if latest_scan is None
+                else now - latest_scan.received_at
+            )
+            if now - self.last_laser_map_error_log >= 2.0:
+                self.get_logger().error(f"laser map rendering failed: {error}")
+                self.last_laser_map_error_log = now
         mpc_updated_at = (
             None if mpc_snapshot is None else mpc_snapshot.updated_at
         )
@@ -992,6 +1156,9 @@ class NavdpImageGoalClient(Node):
             actual_velocity=actual_velocity,
             active_traj=active_traj,
             selected_diffusion=selected_diffusion,
+            laser_obstacle_xy=laser_obstacle_xy,
+            laser_status=laser_status,
+            laser_age_s=laser_age_s,
         )
 
     def _append_mpc_bev_video(self, snapshot: FrameSnapshot) -> None:
@@ -1053,6 +1220,7 @@ class NavdpImageGoalClient(Node):
                 last_odom_time = self.last_odom_time
                 last_plan_time = self.last_plan_time
                 plan_id = self.latest_plan_id
+                latest_scan = self.latest_scan
                 reason = control_stop_reason(
                     now=cycle_start,
                     enable_control=self.args.enable_control,
@@ -1064,6 +1232,12 @@ class NavdpImageGoalClient(Node):
                     frame_timeout=self.args.frame_timeout,
                     odom_timeout=self.args.odom_timeout,
                     plan_timeout=self.args.plan_timeout,
+                    last_scan_time=(
+                        None
+                        if latest_scan is None
+                        else latest_scan.received_at
+                    ),
+                    scan_timeout=self.args.scan_timeout,
                 )
                 if (
                     reason is None
@@ -1078,12 +1252,22 @@ class NavdpImageGoalClient(Node):
             reference_states = None
             solve_ms = None
             solve_started = None
+            control_generation = None
+            command_published = False
             if reason is None and latest_odom is not None:
                 try:
                     with self.mpc_lock:
                         if self.mpc is None:
                             reason = "mpc_missing"
                         else:
+                            with self.data_lock:
+                                control_generation = self.trajectory_generation
+                                plan_id = self.latest_plan_id
+                                if self.arrival_blocked:
+                                    reason = "arrival"
+                                elif not self.trajectory_ready:
+                                    reason = "tracking_invalidated"
+                        if reason is None:
                             reference_states = self.mpc.find_reference_traj(
                                 latest_odom,
                                 self.mpc.ref_traj,
@@ -1102,29 +1286,53 @@ class NavdpImageGoalClient(Node):
                             )
                             if selected_diffusion_snapshot is not None:
                                 selected_diffusion_snapshot.setflags(write=False)
-                    if reason is None:
-                        linear = float(np.clip(controls[0, 0], 0.0, self.args.max_v))
-                        angular = float(
-                            np.clip(controls[0, 1], -self.args.max_w, self.args.max_w)
-                        )
-                        predicted_snapshot = np.asarray(predicted_states).copy()
-                        predicted_snapshot.setflags(write=False)
-                        command_snapshot = np.array(
-                            [linear, angular],
-                            dtype=np.float64,
-                        )
-                        command_snapshot.setflags(write=False)
-                        with self.data_lock:
-                            self.latest_mpc_visualization = (
-                                MpcVisualizationSnapshot(
-                                    predicted_states=predicted_snapshot,
-                                    active_traj=active_traj_snapshot,
-                                    selected_diffusion=selected_diffusion_snapshot,
-                                    command=command_snapshot,
-                                    solve_ms=float(solve_ms),
-                                    updated_at=time.monotonic(),
+                            proposed_linear = float(
+                                np.clip(
+                                    controls[0, 0],
+                                    0.0,
+                                    self.control_max_v,
                                 )
                             )
+                            proposed_angular = float(
+                                np.clip(
+                                    controls[0, 1],
+                                    -self.args.max_w,
+                                    self.args.max_w,
+                                )
+                            )
+                            predicted_snapshot = np.asarray(
+                                predicted_states
+                            ).copy()
+                            predicted_snapshot.setflags(write=False)
+                            command_snapshot = np.array(
+                                [proposed_linear, proposed_angular],
+                                dtype=np.float64,
+                            )
+                            command_snapshot.setflags(write=False)
+                            with self.data_lock:
+                                if self.arrival_blocked:
+                                    reason = "arrival"
+                                elif not tracking_generation_is_current(
+                                    captured_generation=control_generation,
+                                    current_generation=self.trajectory_generation,
+                                    trajectory_ready=self.trajectory_ready,
+                                ):
+                                    reason = "tracking_invalidated"
+                                if reason is None:
+                                    linear = proposed_linear
+                                    angular = proposed_angular
+                                    self.latest_mpc_visualization = (
+                                        MpcVisualizationSnapshot(
+                                            predicted_states=predicted_snapshot,
+                                            active_traj=active_traj_snapshot,
+                                            selected_diffusion=selected_diffusion_snapshot,
+                                            command=command_snapshot,
+                                            solve_ms=float(solve_ms),
+                                            updated_at=time.monotonic(),
+                                        )
+                                    )
+                                self._publish_velocity(linear, angular)
+                                command_published = True
                 except Exception as error:
                     if solve_started is not None:
                         solve_ms = (
@@ -1133,7 +1341,9 @@ class NavdpImageGoalClient(Node):
                     reason = "mpc_error"
                     self.get_logger().error(f"MPC solve failed: {error}")
 
-            self._publish_velocity(linear, angular)
+            if not command_published:
+                with self.data_lock:
+                    self._publish_velocity(linear, angular)
             self._write_diagnostic(
                 {
                     "type": "control",
@@ -1160,6 +1370,14 @@ class NavdpImageGoalClient(Node):
                     "plan_age_s": None
                     if last_plan_time is None
                     else cycle_start - last_plan_time,
+                    "scan_sequence": (
+                        None if latest_scan is None else latest_scan.sequence
+                    ),
+                    "scan_age_s": (
+                        None
+                        if latest_scan is None
+                        else cycle_start - latest_scan.received_at
+                    ),
                 }
             )
             if (
@@ -1185,8 +1403,12 @@ class NavdpImageGoalClient(Node):
         command = TwistStamped()
         command.header.stamp = self.get_clock().now().to_msg()
         command.header.frame_id = self.args.base_frame
-        command.twist.linear.x = linear
-        command.twist.angular.z = angular
+        command.twist.linear.x = float(
+            np.clip(linear, 0.0, self.control_max_v)
+        )
+        command.twist.angular.z = float(
+            np.clip(angular, -self.args.max_w, self.args.max_w)
+        )
         self.control_pub.publish(command)
 
     def stop(self) -> None:
@@ -1264,11 +1486,20 @@ def parse_args() -> argparse.Namespace:
         default="/cam_head/d435/color/camera_info",
     )
     parser.add_argument("--odom-topic", default="/odom")
+    parser.add_argument("--scan-topic", default="/scan")
     parser.add_argument("--cmd-topic", default="/cmd_vel")
     parser.add_argument("--posture-timeout", type=float, default=10.0)
     parser.add_argument("--local-nav-timeout", type=float, default=5.0)
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--camera-frame", default="d435_color_optical_frame")
+    parser.add_argument("--laser-frame", default="laser_frame")
+    parser.add_argument("--laser-x", type=float, default=0.042)
+    parser.add_argument("--laser-y", type=float, default=0.0)
+    parser.add_argument(
+        "--laser-yaw",
+        type=float,
+        default=MIRA3_LASER_YAW_RAD,
+    )
     parser.add_argument("--tf-timeout", type=float, default=0.2)
     parser.add_argument("--visualization-topic", default="/navdp/visualization")
     parser.add_argument(
@@ -1289,19 +1520,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-bev-timeout", type=float, default=0.5)
     parser.add_argument("--opencv-threads", type=int, default=2)
     parser.add_argument("--sync-slop", type=float, default=0.1)
+    parser.add_argument(
+        "--scan-sync-slop",
+        type=float,
+        default=DEFAULT_SCAN_SYNC_SLOP_S,
+    )
+    parser.add_argument("--scan-timeout", type=float, default=0.25)
+    parser.add_argument("--laser-map-resolution", type=float, default=0.05)
     parser.add_argument("--plan-period", type=float, default=0.3)
     parser.add_argument("--max-v", type=float, default=0.1)
-    parser.add_argument("--max-w", type=float, default=0.50)
+    parser.add_argument("--max-w", type=float, default=0.20)
     parser.add_argument("--critic-threshold", type=float, default=-3.0)
-    parser.add_argument("--trajectory-point-spacing", type=float, default=0.05)
-    parser.add_argument("--trajectory-join-distance", type=float, default=0.50)
-    parser.add_argument("--trajectory-join-heading-deg", type=float, default=60.0)
-    parser.add_argument("--trajectory-min-remaining", type=float, default=0.20)
-    parser.add_argument("--arrival-distance", type=float, default=0.2)
+    parser.add_argument("--arrival-distance", type=float, default=0.5)
     parser.add_argument("--arrival-consecutive", type=int, default=3)
     parser.add_argument("--min-matches", type=int, default=8)
     parser.add_argument("--min-inliers", type=int, default=6)
-    parser.add_argument("--skip-trajectory-points", type=int, default=0)
     parser.add_argument("--frame-timeout", type=float, default=1.0)
     parser.add_argument("--odom-timeout", type=float, default=0.5)
     parser.add_argument("--plan-timeout", type=float, default=1.5)

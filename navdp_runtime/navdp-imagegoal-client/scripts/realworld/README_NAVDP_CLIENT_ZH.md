@@ -57,49 +57,55 @@ MPC 速度默认发布到 `LocalNavAction` 实际订阅的 `/cmd_vel`。客户�
 不存在、goal 被拒绝、超时或返回失败时，客户端直接退出，不会启动底盘控制。
 Dry-run 不发送这两个 goal。
 
-MPC 默认限制为 `0.10 m/s` 和 `0.50 rad/s`，并原样发布到 `/cmd_vel`。
-MPC 使用 `/odom` 位姿中的 `[x, y, yaw]` 作为状态，并将线速度和角速度
-`[v, w]` 作为控制量。
+MPC 默认限制为 `--max-v 0.15 m/s` 和 `--max-w 0.50 rad/s`，并原样发布到
+`/cmd_vel`。MPC 使用 `/odom` 位姿中的 `[x, y, yaw]` 作为状态，并将线速度和
+角速度 `[v, w]` 作为控制量。MPC 从采样 guide 的局部切线生成参考 yaw，并使用
+wrap 后的 yaw 误差。急转时优化器可降低 `v`、提高 `|w|`；没有基于 heading
+误差的额外速度约束，也没有额外的 rotate-first 状态机。
 RGB-D 几何验证器第一帧进入
 候选到达状态时立即输出零速度，连续三帧后锁存到达。相机、里程计、规划、
 有效执行轨迹或 MPC 异常也会输出零速度。
 
-## 历史引导点与 TrajectoryManager
+## 上游 NavDP MPC 与 D435 重投影
 
-D435 当前视角下，模型给出的最近引导点可能仍离底盘较远。客户端在 NavDP
-输出和 MPC 之间增加 `TrajectoryManager`，在 `odom` 坐标系保存已经接纳的
-历史引导点。模型每次输出只作为远端候选，不再直接替换 MPC 轨迹。
+客户端以
+`InternRobotics/NavDP@bebb436a9856acbd6ed2a63234a99db6bac2fd3a`
+的 MPC 结构为基础，保留 `N=15`、`T=0.1`、`ref_gap=3` 和
+`R=diag([0.02, 0.15])`。为跟踪 guide 方向并匹配真机速度，本部署有意将
+yaw 代价权重从上游的 `0` 改为 `5`，并将参考速度从上游默认的
+`desired_v=0.5` 改为 `desired_v=--max-v`。客户端采用
+`InternRobotics/InternNav@7a5c62400ac45b313d9b709c740b64191556a242`
+的在线轨迹交接方式：第一条有效轨迹创建 MPC，后续有效 selected diffusion
+只更新同一个 MPC 的 `ref_traj`，不清空上一次最优解的 warm start。控制线程
+发布完当前求解结果后，规划线程再原子更新参考轨迹；有效新规划不会在两个
+控制周期之间额外插入零速度。不保存历史引导点、不补“底盘到首点”的盲区点，
+也不对输入引导点重新采样。
 
-每轮规划会先删除已经走过的历史点，再用当前底盘位置重新锚定轨迹。因此：
+NavDP 原始 selected diffusion 使用真机
+`/cam_head/d435/color/camera_info` 发布的彩色相机内参，并按官方 RGB
+记录方式固定采用水平相机和相机坐标地面 `Z=-0.2 m`。控制轨迹不使用真机
+D435 的安装高度、平移、俯仰、横滚或偏航；黄色 `active_traj` 保留全部
+官方几何转换后的 diffusion 点并直接送给 MPC。青色 selected 使用相同的
+官方平面方向，仅用于对比。
 
-- `active_traj` 的第一个引导点就是当前底盘位置，距离严格为 `0 m`；
-- 后续引导点默认按 `0.05 m` 间距重新采样；
-- 默认速度 `0.10 m/s` 下，MPC 内部参考状态间距约为 `0.06 m`；
-- 新候选只在与历史轨迹的距离和方向连续时更新远端部分；
-- 单帧低 critic、候选几何非法、候选不连续或模型请求暂时失败时，仍执行可用
-  的历史轨迹；
-- 历史轨迹剩余不足 `0.20 m` 且没有可接纳候选时，控制原因变为
-  `trajectory_missing` 并停车。
+真机 D435 optical TF 仍用于 RGB-D BEV 点云反投影和 TF 诊断，不参与
+selected 到黄色 guide 的控制几何。官方控制高度固定为 `0.2 m`，没有运行时
+覆盖参数。
 
-为抑制模型候选在近场来回摆动，默认保留从底盘起始的稳定 `1.0 m` 前缀，
-只允许在其后的远端更新。新候选必须先与历史路径连续重叠至少 `0.5 m`，且该
-重叠段的最大路径误差不超过 `0.30 m`；否则候选被拒绝，继续执行已有历史轨迹。
+如果射线与地面平行、交点位于相机后方、交点不在底盘前方，或者 critic
+低于阈值，本轮规划会清空旧 MPC 和旧执行轨迹并停车，不会继续沿用上一次
+路径。与 NavDP 官方实现一致，diffusion 点列不要求前向距离逐点单调。
 
-第一次还没有历史点时，管理器从底盘位置到模型首个引导点进行线性补点。
-连接规则可通过以下参数调整：
-
-```text
---trajectory-point-spacing 0.05
---trajectory-join-distance 0.50
---trajectory-join-heading-deg 60.0
---trajectory-min-remaining 0.20
---trajectory-commit-horizon 1.0
---trajectory-overlap-length 0.5
---trajectory-overlap-distance 0.30
-```
+上游 MPC 的 `N=15` 表示 15 个预测控制步，时间步长 `T=0.1 s`；它不表示
+diffusion 引导点数量，也不会截断 diffusion 点。完整路径先按上游实现线性
+加密 50 倍，再从离底盘最近的位置起按目标弧长选参考点。`ref_gap=3` 表示
+每 3 个 MPC 步施加一次位置参考代价，因此 MPC 使用
+`N // ref_gap + 1 = 6` 个参考状态。MPC 的参考速度使用
+`desired_v=--max-v`，使参考点间距与可发布速度一致；在默认值下，相邻目标
+参考弧长约为 `0.15 * 3 * 0.1 = 0.045 m`。角速度仍受 `--max-w 0.50` 限制。
 
 红色轨迹表示实际交给 MPC 的 `active_traj`；按 critic 着色的轨迹仍表示模型
-候选，便于观察候选与稳定执行轨迹的差异。
+候选，便于观察重投影前后的差异。
 
 ## NavDP-only D435 TF
 
@@ -193,6 +199,42 @@ NavDP 官方没有语义分割输出。这里复用官方真机评测的
 NAVDP_BLAS_THREADS=2
 ```
 
+### 雷达诊断
+
+客户端直接订阅 `/scan`，不读取 `/costmap` 或 `/costmap_local`。每帧原始
+`LaserScan` 以 `type="scan"` 写入同一个 `*_mpc.jsonl`；`plan` 和
+`control` 记录通过 `scan_sequence` 与雷达帧关联，`plan` 还保存 RGB 与雷达
+时间戳之差 `scan_rgb_dt_s`。
+
+当前二值图由客户端独立生成：`0` 表示本帧没有命中，`100` 表示本帧有效回波
+终点。它不表示未知空间，也不继承任何第三方代价值。地图范围与 BEV 一致，
+前方 `6 m`、后方 `2 m`、左右各 `4 m`，默认分辨率 `0.05 m`。零值、非有限
+值、量程外数据和落在底盘自身矩形内的回波会被忽略。
+
+MPC RGB BEV 中洋红点表示与 RGB 帧时间最近且仍新鲜的雷达命中。状态为
+`LASER WAITING`、`LASER STALE` 或 `LASER ERROR` 时不绘制旧点。洋红雷达层
+位于 selected、guide 和 MPC 轨迹下方，便于直接观察当前轨迹是否穿过障碍。
+
+相关参数及默认值：
+
+```text
+--scan-topic /scan
+--laser-frame laser_frame
+--laser-x 0.042
+--laser-y 0.0
+--laser-yaw 3.141592653589793
+--scan-sync-slop 0.25
+--scan-timeout 0.25
+--laser-map-resolution 0.05
+```
+
+其中 `laser-x/y/yaw` 是 Mira3 的平面激光外参。厂商 `/scan` 约定
+`-180°` 为机器人正前方、`0°` 为后方，因此 `laser-yaw` 必须为 `π`，将扫描
+平面的 `(x,y)` 同时取反后再放入 `base_link`。默认同步窗 `0.25 s` 覆盖当前
+驱动实测的雷达与 RGB header 时间偏移，窗口内仍只选择时间最近的一帧。本版
+本只记录和显示雷达，不改变 NavDP selected、MPC、控制停止条件或
+`/cmd_vel`。
+
 客户端持续发布 `/navdp/visualization`，并原子更新：
 
 ```text
@@ -215,12 +257,15 @@ GPU 服务端官方 MP4 在 HTTP 响应返回前生成；客户端 MP4 记录 10
 
 MPC BEV 视频的图层从下到上包括绿色 `actual` 实走里程计、红色 `MPC` 预测
 轨迹、青色 `selected` 原始 selected diffusion、黄色 `guide` 离散引导点，
-以及最后绘制的白色底盘矩形和方向箭头。青线只在候选被
-`TrajectoryManager` 接纳并成功安装进 MPC 后更新；候选被拒绝时继续显示与
-当前 MPC 参考对应的上一次 selected diffusion。黄色点是
-`TrajectoryManager.active_traj` 在送入 MPC 稠密化前的离散路径，不是 MPC
-控制器内部的稠密 `ref_traj`；第一个较大点表示底盘锚点。青黄两层的分离直接
-表示原始 selected diffusion 经轨迹管理后发生的变化。
+以及最后绘制的白色底盘矩形和方向箭头。青线只在本轮候选通过 critic、
+重投影并成功安装进 MPC 后更新；无效候选不会保留旧路径。青色轨迹使用 NavDP
+原始平面坐标；黄色点一一对应虚拟相机像素经真实 D435 透视与地面求交后的
+完整 diffusion 控制坐标，所有点使用相同尺寸。黄色点不是 MPC 内部加密后的
+`ref_traj`，底盘位置也不会额外生成黄色锚点。青黄两层的分离只表示原始
+selected diffusion 经透视重投影发生的变化。
+
+画面还会沿机器人坐标系 `y=0` 绘制 1 px 深灰色中轴辅助线；它位于 RGB-D
+点云和全部轨迹图层下方，不加入图例，并且在 odom 尚未就绪时仍会显示。
 
 只有 MPC 快照新鲜且里程计为 `ODOM OK` 时才显示红色 MPC 预测、青色 selected
 和黄色 guide；里程计过期时三者都会隐藏，避免在过期坐标系中显示路径。这些
@@ -258,9 +303,11 @@ PYTHONPATH=.. python3 -m unittest \
 /home/dev/NavDP-official-bebb436/navdp_logs/YYYYMMDD_HHMMSS_mpc.jsonl
 ```
 
-`plan` 行记录模型候选、实际 `active_traj`、候选接纳结果、拼接距离、剩余
-轨迹长度、保留历史长度 `trajectory_preserved_length_m`、重叠误差
-`trajectory_overlap_error_m`、规划时的 odom/相机位姿、critic 和规划耗时；
+`plan` 行记录 `selected_local_xy`、原始 `raw_selected_world_xy`、重投影后的
+`reprojected_base_xy` / `reprojected_world_xy`、固定官方相机高度 `0.2 m`、
+重投影状态与拒绝原因，并同时记录实际 `active_traj`、`mpc_horizon`、规划时
+的 odom/相机位姿、critic 和规划耗时；其中 `camera_pose` 仅用于真机 TF 与
+BEV 诊断，不影响控制轨迹投影。
 `control` 行按控制周期记录 odom 位姿与实测速度、发送的 `v/w`、MPC 参考状态、
 预测状态、求解耗时及 frame/odom/plan 数据年龄。其中
 `desired_velocity=[linear_x, angular_z]` 是期望/发布速度，

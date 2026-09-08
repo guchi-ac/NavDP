@@ -22,6 +22,226 @@ from utils_tasks.wheeled_client_core import (
 
 
 class GeometryTests(unittest.TestCase):
+    @staticmethod
+    def level_optical_transform(height):
+        transform = np.eye(4)
+        transform[:3, :3] = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+            ]
+        )
+        transform[:3, 3] = [0.0, 0.0, height]
+        return transform
+
+    def test_official_camera_transform_is_level_at_fixed_height(self):
+        self.assertEqual(client_core.NAVDP_OFFICIAL_CAMERA_HEIGHT_M, 0.2)
+
+        transform = client_core.navdp_official_base_from_camera()
+
+        np.testing.assert_array_equal(
+            transform,
+            np.array(
+                [
+                    [0.0, 0.0, 1.0, 0.0],
+                    [-1.0, 0.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0, 0.2],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            ),
+        )
+
+    def test_navdp_virtual_pixels_match_official_height_formula(self):
+        intrinsic = np.array(
+            [[100.0, 0.0, 2.0], [0.0, 120.0, 2.0], [0.0, 0.0, 1.0]]
+        )
+        local_xy = np.array([[1.0, 0.5], [2.0, -0.5]])
+
+        pixels = client_core.navdp_virtual_pixels(
+            local_xy,
+            intrinsic,
+            image_height=5,
+            virtual_camera_height=0.2,
+        )
+
+        np.testing.assert_allclose(
+            pixels,
+            [[-48.0, 26.0], [27.0, 14.0]],
+            atol=1e-12,
+        )
+
+    def test_navdp_virtual_pixels_reject_nonpositive_forward_point(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: forward distance must be positive",
+        ):
+            client_core.navdp_virtual_pixels(
+                np.array([[0.0, 0.0], [1.0, 0.0]]),
+                np.eye(3),
+                image_height=5,
+            )
+
+    def test_virtual_height_equals_real_height_reprojects_identity(self):
+        intrinsic = np.array(
+            [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+        )
+        local_xy = np.array([[0.5, -0.1], [1.0, 0.2], [2.0, 0.4]])
+
+        ground = client_core.reproject_navdp_to_ground_base(
+            local_xy,
+            intrinsic,
+            image_height=5,
+            base_from_camera=self.level_optical_transform(0.2),
+            virtual_camera_height=0.2,
+        )
+
+        np.testing.assert_allclose(ground, local_xy, atol=1e-12)
+
+    def test_pitched_camera_uses_full_optical_rotation(self):
+        intrinsic = np.array(
+            [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+        )
+        level = self.level_optical_transform(1.0)
+        pitch = math.radians(20.0)
+        pitch_rotation = np.array(
+            [
+                [math.cos(pitch), 0.0, math.sin(pitch)],
+                [0.0, 1.0, 0.0],
+                [-math.sin(pitch), 0.0, math.cos(pitch)],
+            ]
+        )
+        pitched = level.copy()
+        pitched[:3, :3] = pitch_rotation @ level[:3, :3]
+        local_xy = np.array([[1.0, 0.0], [2.0, 0.0]])
+
+        ground = client_core.reproject_navdp_to_ground_base(
+            local_xy,
+            intrinsic,
+            image_height=5,
+            base_from_camera=pitched,
+            virtual_camera_height=0.2,
+        )
+
+        first_ray = pitch_rotation @ np.array([1.0, 0.0, -0.2])
+        second_ray = pitch_rotation @ np.array([1.0, 0.0, -0.1])
+        expected = np.array(
+            [
+                [-first_ray[0] / first_ray[2], 0.0],
+                [-second_ray[0] / second_ray[2], 0.0],
+            ]
+        )
+        np.testing.assert_allclose(ground, expected, atol=1e-12)
+
+    def test_ground_reprojection_rejects_parallel_ray(self):
+        transform = np.eye(4)
+        transform[:3, :3] = np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ]
+        )
+        transform[:3, 3] = [0.0, 0.0, 1.0]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: ray is parallel to ground",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[1.0, 0.0], [2.0, 0.0]]),
+                np.array(
+                    [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+                ),
+                image_height=5,
+                base_from_camera=transform,
+            )
+
+    def test_ground_reprojection_rejects_intersection_behind_camera(self):
+        transform = self.level_optical_transform(-1.0)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: ground intersection is behind camera",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[1.0, 0.0], [2.0, 0.0]]),
+                np.array(
+                    [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+                ),
+                image_height=5,
+                base_from_camera=transform,
+            )
+
+    def test_ground_reprojection_rejects_nan_local_input(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "virtual_reprojection: local_xy must be finite",
+        ):
+            client_core.reproject_navdp_to_ground_base(
+                np.array([[1.0, 0.0], [np.nan, 0.0]]),
+                np.eye(3),
+                image_height=5,
+                base_from_camera=self.level_optical_transform(0.2),
+            )
+
+    def test_ground_reprojection_preserves_reversed_forward_progress(self):
+        trajectory = np.array([[2.0, 0.0], [1.0, 0.0]])
+
+        reprojected = client_core.reproject_navdp_to_ground_base(
+            trajectory,
+            np.array(
+                [[100.0, 0.0, 2.0], [0.0, 100.0, 2.0], [0.0, 0.0, 1.0]]
+            ),
+            image_height=5,
+            base_from_camera=self.level_optical_transform(0.2),
+        )
+
+        np.testing.assert_allclose(reprojected, trajectory, atol=1e-12)
+
+    def test_normalizes_direct_tracking_trajectory_without_resampling(self):
+        trajectory = np.array(
+            [[0.5, 0.1], [0.5, 0.1], [1.0, 0.2], [1.5, 0.4]]
+        )
+
+        normalized = client_core.normalize_tracking_trajectory(trajectory)
+
+        np.testing.assert_array_equal(normalized, trajectory)
+
+    def test_tracking_generation_rejects_a_result_after_invalidation(self):
+        self.assertTrue(
+            client_core.tracking_generation_is_current(
+                captured_generation=4,
+                current_generation=4,
+                trajectory_ready=True,
+            )
+        )
+        self.assertFalse(
+            client_core.tracking_generation_is_current(
+                captured_generation=4,
+                current_generation=5,
+                trajectory_ready=True,
+            )
+        )
+        self.assertFalse(
+            client_core.tracking_generation_is_current(
+                captured_generation=4,
+                current_generation=4,
+                trajectory_ready=False,
+            )
+        )
+
+    def test_rejects_invalid_direct_tracking_trajectory(self):
+        for trajectory in (
+            np.array([[1.0, 0.0]]),
+            np.array([[1.0, 0.0], [1.0, 0.0]]),
+            np.array([[1.0, 0.0], [np.nan, 0.0]]),
+            np.array([1.0, 2.0]),
+        ):
+            with self.subTest(trajectory=trajectory):
+                with self.assertRaises(ValueError):
+                    client_core.normalize_tracking_trajectory(trajectory)
+
     def test_pending_selected_survives_failed_install_and_rejected_retry(self):
         old = np.array([[0.0, 0.0], [1.0, 0.0]])
         accepted = np.array([[0.5, 0.2], [1.5, 0.4]])
@@ -124,425 +344,6 @@ class GeometryTests(unittest.TestCase):
         )
 
 
-class TrajectoryManagerTests(unittest.TestCase):
-    def make_manager(self, **changes):
-        values = dict(
-            point_spacing=0.05,
-            join_distance=0.50,
-            join_heading_degrees=60.0,
-            min_remaining=0.20,
-        )
-        values.update(changes)
-        return client_core.TrajectoryManager(**values)
-
-    def test_blind_history_ends_at_current_candidate_first_point_projection(self):
-        manager = self.make_manager(point_spacing=0.10)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_replaced")
-        self.assertAlmostEqual(result.blind_length_m, 0.7)
-        self.assertEqual(result.diffusion_point_count, 3)
-        np.testing.assert_array_equal(
-            result.active_traj[-3:],
-            [[0.7, 0.0], [1.4, 0.4], [2.0, 0.8]],
-        )
-
-    def test_blind_history_is_not_capped_at_one_meter(self):
-        manager = self.make_manager(point_spacing=0.10)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0], [1.3, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.3, 0.0], [1.7, 0.3], [2.2, 0.6]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertAlmostEqual(result.blind_length_m, 1.3)
-
-    def test_complete_normalized_diffusion_candidate_is_preserved_exactly(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        candidate = np.array(
-            [[0.8, 0.0], [0.8, 0.0], [1.11, 0.17], [1.73, 0.61]]
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        expected = np.array([[0.8, 0.0], [1.11, 0.17], [1.73, 0.61]])
-        self.assertEqual(result.diffusion_point_count, len(expected))
-        np.testing.assert_array_equal(
-            result.active_traj[-len(expected) :],
-            expected,
-        )
-
-    def test_initial_candidate_densifies_only_chassis_blind_connector(self):
-        manager = self.make_manager(point_spacing=0.25)
-        candidate = np.array([[1.0, 0.0], [1.37, 0.23], [2.0, 0.7]])
-
-        result = manager.update(
-            [0.0, 0.0], candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertEqual(result.reason, "initialized")
-        self.assertEqual(result.blind_point_count, 3)
-        self.assertEqual(result.diffusion_point_count, 3)
-        self.assertEqual(result.mpc_prediction_steps, 6)
-        np.testing.assert_array_equal(result.active_traj[-3:], candidate)
-        np.testing.assert_array_equal(result.active_traj[0], [0.0, 0.0])
-
-    def test_initial_candidate_at_chassis_has_zero_blind_guides(self):
-        manager = self.make_manager()
-        candidate = np.array([[0.0, 0.0], [1.0, 0.0]])
-
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.blind_point_count, 0)
-        self.assertEqual(result.blind_length_m, 0.0)
-        self.assertEqual(result.diffusion_point_count, 2)
-        np.testing.assert_array_equal(result.active_traj[-2:], candidate)
-
-    def test_replacement_candidate_at_chassis_has_zero_blind_guides(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        candidate = np.array([[0.0, 0.0], [1.0, 0.0]])
-
-        result = manager.update(
-            [0.0, 0.0],
-            candidate,
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertEqual(result.blind_point_count, 0)
-        self.assertEqual(result.blind_length_m, 0.0)
-        np.testing.assert_array_equal(result.active_traj[-2:], candidate)
-
-    def test_candidate_does_not_need_continuous_overlap(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.2, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [1.6, 0.6], [2.5, 1.2]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-
-    def test_projection_uses_original_history_polyline_at_sharp_corner(self):
-        manager = self.make_manager(join_heading_degrees=180.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.99, 0.0], [0.99, 1.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertAlmostEqual(
-            result.join_distance_m,
-            0.0,
-            places=7,
-        )
-
-    def test_old_path_advances_and_reanchors_at_chassis(self):
-        manager = self.make_manager()
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-        result = manager.update([0.35, 0.02])
-
-        np.testing.assert_array_equal(result.active_traj[0], [0.35, 0.02])
-        self.assertGreater(result.active_traj[-1, 0], 1.9)
-
-    def test_rejects_distant_candidate_without_mutating_history(self):
-        manager = self.make_manager(join_distance=0.10)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.10, 0.0],
-            np.array([[1.1, 1.0], [2.1, 1.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "join_distance")
-        self.assertLess(np.max(np.abs(result.active_traj[:, 1])), 0.11)
-
-    def test_rejects_heading_discontinuity(self):
-        manager = self.make_manager(join_heading_degrees=30.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [1.0, 1.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "join_heading")
-
-    def test_rejects_lateral_join_bridge_despite_matching_path_headings(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.4], [2.0, 0.4]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "join_heading")
-
-    def test_short_join_uses_path_headings_without_altering_candidate(self):
-        manager = self.make_manager(join_heading_degrees=60.0)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [2.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.05], [2.0, 0.05]]),
-            candidate_eligible=True,
-        )
-
-        self.assertTrue(result.candidate_accepted)
-        np.testing.assert_array_equal(
-            result.active_traj[-2:],
-            [[1.0, 0.05], [2.0, 0.05]],
-        )
-
-    def test_low_critic_candidate_retains_history_until_exhausted(self):
-        manager = self.make_manager(min_remaining=0.20)
-        initialized = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        retained = manager.update(
-            [0.50, 0.0],
-            np.array([[0.5, 1.0], [1.0, 1.0]]),
-            candidate_eligible=False,
-        )
-        exhausted = manager.update([0.95, 0.0])
-
-        self.assertEqual(retained.reason, "candidate_low_critic")
-        self.assertIsNotNone(retained.active_traj)
-        self.assertEqual(
-            retained.mpc_prediction_steps,
-            initialized.mpc_prediction_steps,
-        )
-        self.assertIsNone(exhausted.active_traj)
-        self.assertEqual(exhausted.reason, "history_exhausted")
-        self.assertEqual(exhausted.mpc_prediction_steps, 0)
-
-    def test_history_exhausts_when_chassis_has_overshot_terminal_point(self):
-        manager = self.make_manager(min_remaining=0.20)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update([1.30, 0.0])
-
-        self.assertIsNone(result.active_traj)
-        self.assertEqual(result.reason, "history_exhausted")
-
-    def test_history_exhaustion_ignores_lateral_correction_near_terminal(self):
-        manager = self.make_manager(min_remaining=0.20)
-        manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update([0.95, 0.30])
-
-        self.assertIsNone(result.active_traj)
-        self.assertEqual(result.reason, "history_exhausted")
-
-    def test_invalid_candidate_retains_history(self):
-        manager = self.make_manager()
-        initialized = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.10, 0.0],
-            np.array([[math.nan, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertEqual(result.reason, "candidate_invalid")
-        self.assertIsNotNone(result.active_traj)
-        self.assertEqual(
-            result.diffusion_point_count,
-            initialized.diffusion_point_count,
-        )
-
-    def test_tiny_candidate_does_not_replace_healthy_history(self):
-        manager = self.make_manager(min_remaining=0.20)
-        previous = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[0.01, 0.0], [0.011, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertFalse(result.candidate_accepted)
-        self.assertEqual(result.reason, "candidate_too_short")
-        np.testing.assert_array_equal(
-            result.active_traj,
-            previous.active_traj,
-        )
-        self.assertEqual(
-            result.mpc_prediction_steps,
-            previous.mpc_prediction_steps,
-        )
-
-    def test_result_does_not_allow_mutating_manager_state(self):
-        manager = self.make_manager()
-        first = manager.update(
-            [0.0, 0.0],
-            np.array([[0.5, 0.0], [1.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        with self.assertRaises(ValueError):
-            first.active_traj[0] = [99.0, 99.0]
-        second = manager.update([0.10, 0.0])
-
-        self.assertLess(second.active_traj[0, 0], 1.0)
-
-    def test_constructor_parameters_must_be_positive_and_finite(self):
-        for parameter in (
-            "point_spacing",
-            "join_distance",
-            "join_heading_degrees",
-            "min_remaining",
-        ):
-            for value in (0.0, -1.0, math.nan, math.inf):
-                with self.subTest(parameter=parameter, value=value):
-                    with self.assertRaises(ValueError):
-                        self.make_manager(**{parameter: value})
-
-    def test_update_reports_dynamic_lengths_counts_and_timing(self):
-        manager = self.make_manager(point_spacing=0.20)
-        result = manager.update(
-            [0.0, 0.0],
-            np.array([[1.0, 0.0], [3.0, 0.0]]),
-            candidate_eligible=True,
-        )
-
-        self.assertAlmostEqual(result.blind_length_m, 1.0)
-        self.assertEqual(result.blind_point_count, 4)
-        self.assertAlmostEqual(result.diffusion_length_m, 2.0)
-        self.assertEqual(result.diffusion_point_count, 2)
-        self.assertEqual(result.mpc_prediction_steps, 6)
-        self.assertAlmostEqual(result.remaining_length_m, 3.0)
-        self.assertGreaterEqual(result.manager_update_ms, 0.0)
-
-    def test_candidate_must_have_two_distinct_finite_points(self):
-        manager = self.make_manager()
-        for candidate in (
-            np.array([[1.0, 0.0]]),
-            np.array([[1.0, 0.0], [1.0, 0.0]]),
-            np.array([[math.nan, 0.0], [2.0, 0.0]]),
-        ):
-            with self.subTest(candidate=candidate):
-                result = manager.update(
-                    [0.0, 0.0],
-                    candidate,
-                    candidate_eligible=True,
-                )
-                self.assertFalse(result.candidate_accepted)
-                self.assertEqual(result.reason, "candidate_invalid")
-
-    def test_seventy_point_update_completes_within_realtime_budget(self):
-        manager = self.make_manager()
-        x = np.linspace(1.0, 4.5, 70)
-        manager.update(
-            [0.0, 0.0],
-            np.column_stack((x, np.zeros_like(x))),
-            candidate_eligible=True,
-        )
-
-        start = time.perf_counter()
-        result = manager.update(
-            [0.1, 0.0],
-            np.column_stack((x + 0.1, 0.05 * np.sin(x))),
-            candidate_eligible=True,
-        )
-        elapsed = time.perf_counter() - start
-
-        self.assertTrue(result.candidate_accepted)
-        self.assertLess(elapsed, 0.2)
-        self.assertLess(result.manager_update_ms, 200.0)
 
 
 class PostureGoalTests(unittest.TestCase):
@@ -789,6 +590,29 @@ class DiagnosticsWriterTests(unittest.TestCase):
             self.assertEqual(record["solve_ms"], 4.25)
             writer.close()
             writer.close()
+
+    def test_json_writer_serializes_nonfinite_scan_ranges_as_null(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "scan.jsonl"
+            writer = client_core.JsonlWriter(output)
+            writer.write(
+                {
+                    "type": "scan",
+                    "ranges": np.array(
+                        [0.0, np.nan, np.inf, -np.inf],
+                        dtype=np.float32,
+                    ),
+                }
+            )
+            writer.close()
+
+            text = output.read_text(encoding="utf-8")
+            self.assertNotIn("NaN", text)
+            self.assertNotIn("Infinity", text)
+            self.assertEqual(
+                json.loads(text)["ranges"],
+                [0.0, None, None, None],
+            )
 
 
 class VideoFinalizationTests(unittest.TestCase):
@@ -1072,6 +896,142 @@ class RosClientSourceTests(unittest.TestCase):
         )
         return client_path.read_text(encoding="utf-8")
 
+    @classmethod
+    def planning_source(cls):
+        source = cls.client_source()
+        tree = ast.parse(source)
+        planning = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_planning_loop"
+        )
+        return ast.get_source_segment(source, planning)
+
+    def test_control_uses_laser_adjusted_xy_in_odom_without_reprojection(self):
+        planning_source = self.planning_source()
+
+        self.assertIn(
+            "algo = navigator_reset(\n"
+            "                        snapshot.intrinsic,",
+            planning_source,
+        )
+        self.assertIn(
+            "raw_selected_world_xy = trajectory_to_world(\n"
+            "                    raw_local_xy,\n"
+            "                    snapshot.odom_xy_yaw,\n"
+            "                )",
+            planning_source,
+        )
+        self.assertIn(
+            "active_traj = normalize_tracking_trajectory(\n"
+            "                        trajectory_to_world(\n"
+            "                            adjusted_local_xy,\n"
+            "                            snapshot.odom_xy_yaw,\n"
+            "                        )\n"
+            "                    )",
+            planning_source,
+        )
+        self.assertIn(
+            "dense_local_xy = Mpc_controller.make_ref_denser(",
+            planning_source,
+        )
+        self.assertIn(
+            "laser_result = prepare_live_laser_trajectory(",
+            planning_source,
+        )
+        self.assertNotIn("reproject_navdp_to_ground_base", planning_source)
+        self.assertNotIn("navdp_official_base_from_camera", planning_source)
+
+    def test_selected_and_guide_world_paths_ignore_live_camera_planar_pose(self):
+        planning_source = self.planning_source()
+
+        self.assertIn(
+            "raw_selected_world_xy = trajectory_to_world(\n"
+            "                    raw_local_xy,\n"
+            "                    snapshot.odom_xy_yaw,\n"
+            "                )",
+            planning_source,
+        )
+
+    def test_live_camera_transform_remains_available_to_rgbd_bev(self):
+        source = self.client_source()
+        tree = ast.parse(source)
+        render_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_mpc_bev"
+        )
+        render_source = ast.get_source_segment(source, render_method)
+
+        self.assertIn(
+            "base_from_camera=snapshot.base_from_camera",
+            render_source,
+        )
+
+    def test_client_tracks_adjusted_path_but_snapshots_raw_selected(self):
+        source = self.client_source()
+
+        for required in (
+            "raw_selected_world_xy",
+            "adjusted_local_xy",
+            "normalize_tracking_trajectory(\n"
+            "                        trajectory_to_world(",
+            ".stage(raw_selected_world_xy, True)",
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn("reproject_navdp_to_ground_base", source)
+        self.assertNotIn("reprojected_base_xy", source)
+        self.assertNotIn("reprojected_world_xy", source)
+        self.assertNotIn("TrajectoryManager", source)
+        self.assertNotIn("trajectory_manager.update", source)
+        self.assertNotIn(
+            "candidate_world_xy=retained_raw_world_xy",
+            source,
+        )
+
+    def test_client_has_no_reprojection_failure_state(self):
+        source = self.client_source()
+
+        self.assertIn("self.installed_active_traj = None", source)
+        self.assertIn("self._invalidate_tracking_state()", source)
+        self.assertNotIn("reprojection_error", source)
+        self.assertNotIn("reprojection_status", source)
+        self.assertNotIn("last_reprojection_error_log", source)
+        self.assertNotIn("trajectory_manager.update", source)
+
+    def test_client_has_no_virtual_camera_control_options(self):
+        source = self.client_source()
+        client_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "realworld"
+            / "navdp_imagegoal_client.py"
+        )
+        help_result = subprocess.run(
+            [sys.executable, str(client_path), "--help"],
+            cwd=client_path.parents[2],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertNotIn("--virtual-camera-height", help_result.stdout)
+        self.assertNotIn("args.virtual_camera_height", source)
+        self.assertNotIn("NAVDP_OFFICIAL_CAMERA_HEIGHT_M", source)
+
+    def test_client_logs_raw_selected_and_active_plan_geometry(self):
+        source = self.client_source()
+
+        for required in (
+            '"raw_selected_world_xy": raw_selected_world_xy',
+            '"active_traj": active_traj',
+        ):
+            self.assertIn(required, source)
+        self.assertNotIn('"reprojected_base_xy"', source)
+        self.assertNotIn('"reprojected_world_xy"', source)
+        self.assertNotIn('"reprojection_status"', source)
+
     def test_client_has_real_robot_inputs_and_explicit_control_gate(self):
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -1255,7 +1215,7 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_controller_copy_records_internnav_mit_provenance(self):
+    def test_controller_copy_records_upstream_navdp_provenance(self):
         controller_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -1265,11 +1225,11 @@ class RosClientSourceTests(unittest.TestCase):
 
         source = controller_path.read_text(encoding="utf-8")
 
-        self.assertIn("InternRobotics/InternNav", source)
-        self.assertIn("MIT License", source)
+        self.assertIn("InternRobotics/NavDP", source)
+        self.assertIn("bebb436a9856acbd6ed2a63234a99db6bac2fd3a", source)
         self.assertIn("class Mpc_controller", source)
 
-    def test_controller_cost_tracks_reference_yaw(self):
+    def test_controller_uses_guide_yaw_reference_and_tuned_cost(self):
         controller_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -1279,7 +1239,11 @@ class RosClientSourceTests(unittest.TestCase):
         source = controller_path.read_text(encoding="utf-8")
 
         self.assertIn("Q = np.diag([10.0, 10.0, 5.0])", source)
-        self.assertIn("reference_poses_from_xy(ref_traj, x0[2])", source)
+        self.assertIn("R = np.diag([0.02, 0.15])", source)
+        self.assertIn(
+            "reference_poses_from_xy(ref_traj, x0[2])",
+            source,
+        )
         self.assertNotIn("np.zeros((ref_traj.shape[0], 1))", source)
 
     def test_client_uses_pose_only_for_kinematic_mpc(self):
@@ -1376,7 +1340,7 @@ class RosClientSourceTests(unittest.TestCase):
         ):
             self.assertNotIn(removed, source)
 
-    def test_client_publishes_mpc_linear_velocity_without_hidden_scaling(self):
+    def test_client_publishes_mpc_linear_velocity_with_live_safety_cap(self):
         client_path = (
             Path(__file__).resolve().parents[1]
             / "scripts"
@@ -1385,7 +1349,10 @@ class RosClientSourceTests(unittest.TestCase):
         )
         source = client_path.read_text(encoding="utf-8")
 
-        self.assertIn("command.twist.linear.x = linear", source)
+        self.assertIn(
+            "np.clip(linear, 0.0, self.control_max_v)",
+            source,
+        )
         self.assertNotIn("1.5*linear", source)
 
     def test_readme_documents_navdp_only_d435_tf_runtime(self):
@@ -1410,6 +1377,12 @@ class RosClientSourceTests(unittest.TestCase):
             "`static_transform_publisher`",
             "/home/dev/navdp_deployment/navdp_runtime/navdp-imagegoal-client",
             "--goal-image goal_far.jpg",
+            "/cam_head/d435/color/camera_info",
+            "`Z=-0.2 m`",
+            "官方控制高度固定为 `0.2 m`",
+            "真机 D435 optical TF 仍用于 RGB-D BEV",
+            "黄色",
+            "青色",
         ):
             self.assertIn(required, source)
         for removed in (
@@ -1419,6 +1392,8 @@ class RosClientSourceTests(unittest.TestCase):
             "ros2 action send_goal /Torso/torso_action_service",
             "torso_mask: [false, false]",
             "/home/dev/navdp_runtime/navdp-imagegoal-client",
+            "--virtual-camera-height",
+            "虚拟相机高度可显式配置",
         ):
             self.assertNotIn(removed, source)
 
@@ -1469,48 +1444,38 @@ class RosClientSourceTests(unittest.TestCase):
             self.assertIn(required, source)
         self.assertNotIn("all_trajectories_rejected", source)
 
-    def test_client_visualizes_skipped_prefix_separately_from_mpc_trajectory(self):
-        client_path = (
-            Path(__file__).resolve().parents[1]
-            / "scripts"
-            / "realworld"
-            / "navdp_imagegoal_client.py"
-        )
-        source = client_path.read_text(encoding="utf-8")
-
-        for required in (
-            "raw_local_xy",
-            "trajectory_prefix",
-            "trajectory_prefix_points=state.trajectory_prefix",
-        ):
-            self.assertIn(required, source)
-
-    def test_client_routes_model_candidate_through_trajectory_manager(self):
+    def test_client_does_not_drop_a_configurable_diffusion_prefix(self):
         source = self.client_source()
 
-        self.assertIn("TrajectoryManager(", source)
-        self.assertIn("candidate_eligible=critic_safe", source)
-        self.assertIn("active_traj = trajectory_update.active_traj", source)
-        self.assertIn(
-            "N=trajectory_update.diffusion_point_count",
-            source,
-        )
-        self.assertIn(
-            "blind_steps=trajectory_update.blind_point_count",
-            source,
-        )
-        self.assertNotIn("self.mpc.update_ref_traj(world_xy)", source)
+        self.assertNotIn("skip_trajectory_points", source)
+        self.assertNotIn("--skip-trajectory-points", source)
 
-    def test_client_rebuilds_mpc_only_for_changed_total_horizon(self):
+    def test_client_installs_complete_adjusted_diffusion_in_upstream_mpc(self):
         source = self.client_source()
 
         self.assertIn(
-            "self.mpc.prediction_steps\n"
-            "                            != trajectory_update.mpc_prediction_steps",
+            "active_traj = normalize_tracking_trajectory(\n"
+            "                        trajectory_to_world(\n"
+            "                            adjusted_local_xy,",
             source,
         )
-        self.assertIn("self.mpc = Mpc_controller(", source)
-        self.assertIn("self.mpc.update_ref_traj(", source)
+        self.assertIn("next_mpc = Mpc_controller(", source)
+        self.assertIn("desired_v=self.control_max_v * 0.8", source)
+        self.assertIn("v_max=self.control_max_v", source)
+        self.assertIn("w_max=self.args.max_w", source)
+        self.assertIn("ref_traj_is_dense=True", source)
+        self.assertNotIn("TrajectoryManager", source)
+        self.assertNotIn("trajectory_update", source)
+        self.assertNotIn("blind_steps=", source)
+        self.assertNotIn("N=trajectory_update", source)
+        self.assertNotIn("reprojected_world_xy", source)
+
+    def test_client_reuses_upstream_mpc_for_valid_plan_updates(self):
+        source = self.client_source()
+
+        self.assertIn("next_mpc = Mpc_controller(", source)
+        self.assertIn("self.mpc.update_dense_ref_traj(active_traj)", source)
+        self.assertNotIn("prediction_steps", source)
 
     def test_client_gates_control_on_active_trajectory(self):
         source = self.client_source()
@@ -1525,7 +1490,17 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertIn("failed to install active trajectory", source)
         self.assertIn('reason = "active_trajectory_error"', source)
 
-    def test_client_exposes_trajectory_manager_defaults(self):
+    def test_client_invalidates_inflight_control_and_bev_snapshot(self):
+        source = self.client_source()
+
+        self.assertIn("self.trajectory_generation += 1", source)
+        self.assertIn("self.latest_mpc_visualization = None", source)
+        self.assertIn("tracking_generation_is_current(", source)
+        self.assertIn("captured_generation=control_generation", source)
+        self.assertIn('reason = "tracking_invalidated"', source)
+        self.assertNotIn('reason = "plan_superseded"', source)
+
+    def test_client_does_not_expose_trajectory_manager_options(self):
         source = self.client_source()
         client_path = (
             Path(__file__).resolve().parents[1]
@@ -1541,52 +1516,27 @@ class RosClientSourceTests(unittest.TestCase):
             text=True,
         )
 
-        for required in (
-            '--trajectory-point-spacing", type=float, default=0.05',
-            '--trajectory-join-distance", type=float, default=0.50',
-            '--trajectory-join-heading-deg", type=float, default=60.0',
-            '--trajectory-min-remaining", type=float, default=0.20',
-        ):
-            self.assertIn(required, source)
-
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertNotIn("--trajectory-history-distance", help_result.stdout)
-        self.assertNotIn("--trajectory-commit-horizon", help_result.stdout)
-        self.assertNotIn("--trajectory-overlap-length", help_result.stdout)
-        self.assertNotIn("--trajectory-overlap-distance", help_result.stdout)
-        self.assertNotIn("trajectory_history_distance", source)
-        self.assertNotIn("history_distance=", source)
+        self.assertNotIn("--trajectory-", help_result.stdout)
+        self.assertNotIn("trajectory_point_spacing", source)
+        self.assertNotIn("trajectory_join_distance", source)
+        self.assertNotIn("trajectory_join_heading_deg", source)
+        self.assertNotIn("trajectory_min_remaining", source)
 
-    def test_client_records_candidate_decision_and_active_trajectory(self):
+    def test_client_records_direct_selected_active_trajectory(self):
         source = self.client_source()
 
         for required in (
-            '"candidate_world_xy": retained_world_xy',
+            '"raw_selected_world_xy": raw_selected_world_xy',
             '"active_traj": active_traj',
-            '"candidate_accepted": trajectory_update.candidate_accepted',
-            '"trajectory_reason": trajectory_update.reason',
-            '"trajectory_join_distance_m"',
-            "trajectory_update.join_distance_m",
-            '"trajectory_remaining_length_m"',
-            "trajectory_update.remaining_length_m",
-            '"trajectory_blind_length_m"',
-            "trajectory_update.blind_length_m",
-            '"trajectory_blind_point_count"',
-            "trajectory_update.blind_point_count",
-            '"trajectory_diffusion_length_m"',
-            "trajectory_update.diffusion_length_m",
-            '"trajectory_diffusion_point_count"',
-            "trajectory_update.diffusion_point_count",
-            '"mpc_prediction_steps"',
-            "trajectory_update.mpc_prediction_steps",
-            '"trajectory_manager_update_ms"',
-            "trajectory_update.manager_update_ms",
+            '"mpc_horizon": self.mpc.N',
         ):
             self.assertIn(required, source)
-        self.assertNotIn('"trajectory_history_length_m"', source)
-        self.assertNotIn('"trajectory_far_length_m"', source)
-        self.assertNotIn('"trajectory_preserved_length_m"', source)
-        self.assertNotIn('"trajectory_overlap_error_m"', source)
+        self.assertNotIn('"candidate_accepted"', source)
+        self.assertNotIn('"trajectory_reason"', source)
+        self.assertNotIn('"trajectory_blind_', source)
+        self.assertNotIn('"trajectory_diffusion_', source)
+        self.assertNotIn('"trajectory_manager_update_ms"', source)
 
     def test_bev_uses_rgbd_snapshot_odom_as_the_render_pose(self):
         source = self.client_source()
@@ -1737,8 +1687,9 @@ class RosClientSourceTests(unittest.TestCase):
             "selected_diffusion: Optional[np.ndarray]",
             "self.installed_active_traj: Optional[np.ndarray] = None",
             "self.selected_diffusion_state = SelectedDiffusionInstallState()",
-            "self.installed_active_traj = np.asarray(active_traj).copy()",
-            "self.installed_active_traj.setflags(write=False)",
+            "next_active_traj = np.asarray(active_traj).copy()",
+            "next_active_traj.setflags(write=False)",
+            "self.installed_active_traj = next_active_traj",
             "active_traj_snapshot = self.installed_active_traj.copy()",
             "active_traj_snapshot.setflags(write=False)",
             "self.selected_diffusion_state.installed",
@@ -1771,7 +1722,7 @@ class RosClientSourceTests(unittest.TestCase):
         self.assertLess(active_traj_assignment, render_call)
         self.assertLess(selected_assignment, selected_render_call)
 
-    def test_client_stages_selected_before_install_and_commits_after_success(self):
+    def test_client_publishes_selected_only_after_mpc_construction(self):
         source = self.client_source()
         tree = ast.parse(source)
         planning_method = next(
@@ -1804,24 +1755,28 @@ class RosClientSourceTests(unittest.TestCase):
             )
             or (
                 isinstance(call.func, ast.Attribute)
-                and call.func.attr == "update_ref_traj"
+                and call.func.attr == "update_dense_ref_traj"
             )
         ]
-        selected_stage = next(
-            call
-            for call in install_calls
-            if isinstance(call.func, ast.Attribute)
-            and call.func.attr == "stage"
-        )
         selected_commit = next(
             call
             for call in install_calls
             if isinstance(call.func, ast.Attribute)
             and call.func.attr == "commit"
         )
+        selected_publish = next(
+            node
+            for node in ast.walk(install_try)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "selected_diffusion_state"
+                for target in node.targets
+            )
+        )
 
-        self.assertLess(selected_stage.lineno, min(mpc_install_lines))
         self.assertGreater(selected_commit.lineno, max(mpc_install_lines))
+        self.assertGreater(selected_publish.lineno, max(mpc_install_lines))
 
     def test_client_hides_odom_frame_paths_when_odom_is_stale_but_mpc_is_fresh(self):
         source = self.client_source()

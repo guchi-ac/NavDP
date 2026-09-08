@@ -12,20 +12,6 @@ import cv2
 import numpy as np
 
 
-@dataclass(frozen=True)
-class TrajectoryUpdate:
-    active_traj: Optional[np.ndarray]
-    candidate_accepted: bool
-    reason: str
-    join_distance_m: Optional[float]
-    blind_length_m: float
-    blind_point_count: int
-    diffusion_length_m: float
-    diffusion_point_count: int
-    mpc_prediction_steps: int
-    remaining_length_m: float
-    manager_update_ms: float
-
 
 @dataclass(frozen=True)
 class SelectedDiffusionInstallState:
@@ -59,365 +45,37 @@ class SelectedDiffusionInstallState:
         return SelectedDiffusionInstallState()
 
 
-class TrajectoryManager:
-    """Maintain a stable odometry-frame guide path for MPC."""
-
-    def __init__(
-        self,
-        *,
-        point_spacing: float = 0.05,
-        join_distance: float = 0.50,
-        join_heading_degrees: float = 60.0,
-        min_remaining: float = 0.20,
+def normalize_tracking_trajectory(points) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or len(points) < 2
+        or not np.isfinite(points).all()
     ):
-        values = {
-            "point_spacing": point_spacing,
-            "join_distance": join_distance,
-            "join_heading_degrees": join_heading_degrees,
-            "min_remaining": min_remaining,
-        }
-        for name, value in values.items():
-            if not np.isfinite(value) or value <= 0.0:
-                raise ValueError(f"{name} must be positive and finite")
-        self.point_spacing = float(point_spacing)
-        self.join_distance = float(join_distance)
-        self.join_heading = math.radians(float(join_heading_degrees))
-        self.min_remaining = float(min_remaining)
-        self._active_traj = None
-        self._blind_length_m = 0.0
-        self._blind_point_count = 0
-        self._diffusion_length_m = 0.0
-        self._diffusion_point_count = 0
-
-    def update(
-        self,
-        chassis_xy,
-        candidate_world_xy=None,
-        candidate_eligible: bool = False,
-    ) -> TrajectoryUpdate:
-        update_started = time.perf_counter()
-        chassis = np.asarray(chassis_xy, dtype=np.float64)
-        if chassis.shape != (2,) or not np.isfinite(chassis).all():
-            raise ValueError("chassis_xy must be a finite shape-(2,) point")
-
-        history, had_history = self._advance_history(chassis)
-        active = history
-        accepted = False
-        join_distance_m = None
-        reason = "history_retained" if history is not None else "no_history"
-
-        candidate = None
-        if candidate_world_xy is not None:
-            if not candidate_eligible:
-                reason = "candidate_low_critic"
-            else:
-                try:
-                    candidate = self._normalize_polyline(candidate_world_xy)
-                except ValueError:
-                    reason = "candidate_invalid"
-
-        if candidate is not None:
-            if history is None:
-                blind_path = self._build_blind_path(
-                    np.vstack((chassis, candidate[0]))
-                )
-                blind_guides = blind_path[1:-1]
-                initialized = self._assemble_active_trajectory(
-                    chassis,
-                    blind_guides,
-                    candidate,
-                )
-                if self._polyline_length(initialized) >= self.min_remaining:
-                    active = initialized
-                    accepted = True
-                    reason = "initialized"
-                    self._set_candidate_metadata(
-                        blind_path,
-                        blind_guides,
-                        candidate,
-                    )
-                else:
-                    reason = "candidate_too_short"
-            else:
-                history_cumulative = self._cumulative_lengths(history)
-                (
-                    join_distance_m,
-                    segment_index,
-                    join_point,
-                    _,
-                ) = self._projection_with_arc(
-                    history,
-                    history_cumulative,
-                    candidate[0],
-                )
-                history_heading = (
-                    history[segment_index + 1] - history[segment_index]
-                )
-                candidate_heading = candidate[1] - candidate[0]
-                if join_distance_m > self.join_distance:
-                    reason = "join_distance"
-                else:
-                    if join_distance_m <= self.point_spacing:
-                        heading_deltas = [
-                            self._heading_delta(
-                                history_heading,
-                                candidate_heading,
-                            )
-                        ]
-                    else:
-                        connector_heading = candidate[0] - join_point
-                        heading_deltas = [
-                            self._heading_delta(
-                                history_heading,
-                                connector_heading,
-                            ),
-                            self._heading_delta(
-                                connector_heading,
-                                candidate_heading,
-                            ),
-                        ]
-                    if max(heading_deltas) > self.join_heading:
-                        reason = "join_heading"
-                    else:
-                        prefix_points = list(history[: segment_index + 1])
-                        if not np.allclose(
-                            prefix_points[-1],
-                            join_point,
-                            rtol=0.0,
-                            atol=np.finfo(np.float64).eps,
-                        ):
-                            prefix_points.append(join_point)
-                        if not np.allclose(
-                            prefix_points[-1],
-                            candidate[0],
-                            rtol=0.0,
-                            atol=np.finfo(np.float64).eps,
-                        ):
-                            prefix_points.append(candidate[0])
-                        blind_path = self._build_blind_path(
-                            np.asarray(prefix_points)
-                        )
-                        blind_guides = blind_path[1:-1]
-                        proposed = self._assemble_active_trajectory(
-                            chassis,
-                            blind_guides,
-                            candidate,
-                        )
-                        if (
-                            self._polyline_length(proposed)
-                            < self.min_remaining
-                        ):
-                            reason = "candidate_too_short"
-                        else:
-                            active = proposed
-                            accepted = True
-                            reason = "candidate_replaced"
-                            self._set_candidate_metadata(
-                                blind_path,
-                                blind_guides,
-                                candidate,
-                            )
-
-        if active is None and had_history and candidate_world_xy is None:
-            reason = "history_exhausted"
-        self._active_traj = None if active is None else active.copy()
-        if self._active_traj is None:
-            self._clear_candidate_metadata()
-        remaining = (
-            0.0
-            if self._active_traj is None
-            else self._polyline_length(self._active_traj)
+        raise ValueError(
+            "trajectory must be finite with shape (N, 2), N >= 2"
         )
-        result_traj = (
-            None if self._active_traj is None else self._active_traj.copy()
-        )
-        if result_traj is not None:
-            result_traj.setflags(write=False)
-        return TrajectoryUpdate(
-            active_traj=result_traj,
-            candidate_accepted=accepted,
-            reason=reason,
-            join_distance_m=join_distance_m,
-            blind_length_m=self._blind_length_m,
-            blind_point_count=self._blind_point_count,
-            diffusion_length_m=self._diffusion_length_m,
-            diffusion_point_count=self._diffusion_point_count,
-            mpc_prediction_steps=(
-                self._blind_point_count + self._diffusion_point_count
-            ),
-            remaining_length_m=remaining,
-            manager_update_ms=(time.perf_counter() - update_started) * 1000.0,
-        )
-
-    @staticmethod
-    def _normalize_polyline(points) -> np.ndarray:
-        points = np.asarray(points, dtype=np.float64)
-        if (
-            points.ndim != 2
-            or points.shape[1] != 2
-            or len(points) < 2
-            or not np.isfinite(points).all()
-        ):
-            raise ValueError("trajectory must be finite with shape (N, 2), N >= 2")
-        keep = np.concatenate(
-            (
-                np.array([True]),
-                np.linalg.norm(np.diff(points, axis=0), axis=1)
-                > np.finfo(np.float64).eps,
-            )
-        )
-        normalized = points[keep]
-        if len(normalized) < 2:
-            raise ValueError("trajectory must contain two distinct points")
-        return normalized
-
-    @staticmethod
-    def _polyline_length(points: np.ndarray) -> float:
-        return float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-
-    @staticmethod
-    def _cumulative_lengths(points: np.ndarray) -> np.ndarray:
-        return np.concatenate(
-            ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-        )
-
-    def _densify_preserving_vertices(self, points: np.ndarray) -> np.ndarray:
-        points = self._normalize_polyline(points)
-        dense = [points[0]]
-        for start, end in zip(points[:-1], points[1:]):
-            segment = end - start
-            length = float(np.linalg.norm(segment))
-            for distance in np.arange(
-                self.point_spacing,
-                length,
-                self.point_spacing,
-            ):
-                dense.append(start + segment * (distance / length))
-            dense.append(end)
-        return self._normalize_polyline(np.asarray(dense))
-
-    def _build_blind_path(self, points: np.ndarray) -> np.ndarray:
-        points = np.asarray(points, dtype=np.float64)
-        keep = np.concatenate(
-            (
-                np.array([True]),
-                np.linalg.norm(np.diff(points, axis=0), axis=1)
-                > np.finfo(np.float64).eps,
-            )
-        )
-        distinct = points[keep]
-        if len(distinct) == 1:
-            return distinct
-        return self._densify_preserving_vertices(distinct)
-
-    @staticmethod
-    def _assemble_active_trajectory(
-        chassis: np.ndarray,
-        blind_guides: np.ndarray,
-        candidate: np.ndarray,
-    ) -> np.ndarray:
-        if (
-            len(blind_guides) == 0
-            and np.array_equal(chassis, candidate[0])
-        ):
-            return candidate.copy()
-        return np.vstack((chassis, blind_guides, candidate))
-
-    def _set_candidate_metadata(
-        self,
-        blind_path: np.ndarray,
-        blind_guides: np.ndarray,
-        candidate: np.ndarray,
+    if not np.any(
+        np.linalg.norm(points - points[0], axis=1)
+        > np.finfo(np.float64).eps
     ):
-        self._blind_length_m = self._polyline_length(blind_path)
-        self._blind_point_count = len(blind_guides)
-        self._diffusion_length_m = self._polyline_length(candidate)
-        self._diffusion_point_count = len(candidate)
+        raise ValueError("trajectory must contain two distinct points")
+    return points
 
-    def _clear_candidate_metadata(self):
-        self._blind_length_m = 0.0
-        self._blind_point_count = 0
-        self._diffusion_length_m = 0.0
-        self._diffusion_point_count = 0
 
-    @staticmethod
-    def _projection_with_arc(
-        polyline: np.ndarray,
-        cumulative: np.ndarray,
-        point: np.ndarray,
-    ):
-        best = (math.inf, 0, polyline[0], 0.0)
-        for index, (start, end) in enumerate(zip(polyline[:-1], polyline[1:])):
-            segment = end - start
-            segment_length = float(np.linalg.norm(segment))
-            fraction = float(
-                np.clip(
-                    np.dot(point - start, segment) / np.dot(segment, segment),
-                    0.0,
-                    1.0,
-                )
-            )
-            projection = start + fraction * segment
-            distance = float(np.linalg.norm(point - projection))
-            if distance < best[0]:
-                projection_arc = float(
-                    cumulative[index] + fraction * segment_length
-                )
-                best = (distance, index, projection, projection_arc)
-        return best
+def tracking_generation_is_current(
+    *,
+    captured_generation: int,
+    current_generation: int,
+    trajectory_ready: bool,
+) -> bool:
+    return (
+        trajectory_ready
+        and captured_generation == current_generation
+    )
 
-    @classmethod
-    def _closest_projection(cls, polyline: np.ndarray, point: np.ndarray):
-        distance, index, projection, _ = cls._projection_with_arc(
-            polyline,
-            cls._cumulative_lengths(polyline),
-            point,
-        )
-        return distance, index, projection
 
-    def _advance_history(self, chassis: np.ndarray):
-        if self._active_traj is None:
-            return None, False
-        _, segment_index, projection = self._closest_projection(
-            self._active_traj,
-            chassis,
-        )
-        forward_length = float(
-            np.linalg.norm(
-                self._active_traj[segment_index + 1] - projection
-            )
-        )
-        if segment_index + 1 < len(self._active_traj) - 1:
-            forward_length += self._polyline_length(
-                self._active_traj[segment_index + 1 :]
-            )
-        if forward_length < self.min_remaining:
-            return None, True
-        try:
-            remainder = self._normalize_polyline(
-                np.vstack(
-                    (
-                        chassis,
-                        projection,
-                        self._active_traj[segment_index + 1 :],
-                    )
-                )
-            )
-        except ValueError:
-            return None, True
-        remainder[0] = chassis
-        return remainder, True
-
-    @staticmethod
-    def _heading_delta(first: np.ndarray, second: np.ndarray) -> float:
-        first_angle = math.atan2(first[1], first[0])
-        second_angle = math.atan2(second[1], second[0])
-        return abs(
-            math.atan2(
-                math.sin(second_angle - first_angle),
-                math.cos(second_angle - first_angle),
-            )
-        )
 
 
 def configure_navdp_posture_goal(goal):
@@ -750,6 +408,130 @@ def transform_matrix_from_translation_quaternion(
     return transform
 
 
+NAVDP_OFFICIAL_CAMERA_HEIGHT_M = 0.2
+
+
+def navdp_official_base_from_camera() -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    transform[:3, 3] = np.array(
+        [0.0, 0.0, NAVDP_OFFICIAL_CAMERA_HEIGHT_M],
+        dtype=np.float64,
+    )
+    return transform
+
+
+def navdp_virtual_pixels(
+    local_xy: np.ndarray,
+    intrinsic: np.ndarray,
+    image_height: int,
+    virtual_camera_height: float = 0.2,
+) -> np.ndarray:
+    local_xy = np.asarray(local_xy, dtype=np.float64)
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    if local_xy.ndim != 2 or local_xy.shape[1] != 2 or len(local_xy) < 2:
+        raise ValueError(
+            "virtual_reprojection: local_xy must have shape (N, 2), N >= 2"
+        )
+    if intrinsic.shape != (3, 3) or not np.isfinite(intrinsic).all():
+        raise ValueError(
+            "virtual_reprojection: intrinsic must be finite shape (3, 3)"
+        )
+    if (
+        isinstance(image_height, (bool, np.bool_))
+        or not isinstance(image_height, (int, np.integer))
+        or image_height <= 0
+    ):
+        raise ValueError("virtual_reprojection: image_height must be positive")
+    if not np.isfinite(virtual_camera_height) or virtual_camera_height <= 0.0:
+        raise ValueError(
+            "virtual_reprojection: virtual camera height must be positive"
+        )
+    if not np.isfinite(local_xy).all():
+        raise ValueError("virtual_reprojection: local_xy must be finite")
+    forward = local_xy[:, 0]
+    if np.any(forward <= 0.0):
+        raise ValueError(
+            "virtual_reprojection: forward distance must be positive"
+        )
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError(
+            "virtual_reprojection: focal lengths must be positive"
+        )
+    u = fx * (-local_xy[:, 1] / forward) + cx
+    v = (
+        float(image_height - 1)
+        + fy * (virtual_camera_height / forward)
+        - cy
+    )
+    return np.column_stack((u, v))
+
+
+def reproject_navdp_to_ground_base(
+    local_xy: np.ndarray,
+    intrinsic: np.ndarray,
+    image_height: int,
+    base_from_camera: np.ndarray,
+    virtual_camera_height: float = 0.2,
+) -> np.ndarray:
+    pixels = navdp_virtual_pixels(
+        local_xy,
+        intrinsic,
+        image_height,
+        virtual_camera_height,
+    )
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    base_from_camera = np.asarray(base_from_camera, dtype=np.float64)
+    if (
+        base_from_camera.shape != (4, 4)
+        or not np.isfinite(base_from_camera).all()
+    ):
+        raise ValueError(
+            "virtual_reprojection: base_from_camera must be finite shape (4, 4)"
+        )
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    camera_rays = np.column_stack(
+        (
+            (pixels[:, 0] - cx) / fx,
+            (pixels[:, 1] - cy) / fy,
+            np.ones(len(pixels)),
+        )
+    )
+    base_rays = camera_rays @ base_from_camera[:3, :3].T
+    camera_origin = base_from_camera[:3, 3]
+    vertical = base_rays[:, 2]
+    if np.any(np.abs(vertical) <= np.finfo(np.float64).eps):
+        raise ValueError(
+            "virtual_reprojection: ray is parallel to ground"
+        )
+    scales = -camera_origin[2] / vertical
+    if np.any(scales <= 0.0):
+        raise ValueError(
+            "virtual_reprojection: ground intersection is behind camera"
+        )
+    base_points = camera_origin + scales[:, None] * base_rays
+    base_xy = base_points[:, :2]
+    if not np.isfinite(base_xy).all():
+        raise ValueError(
+            "virtual_reprojection: ground intersection must be finite"
+        )
+    if np.any(base_xy[:, 0] <= 0.0):
+        raise ValueError(
+            "virtual_reprojection: ground intersection must be forward"
+        )
+    return base_xy
+
+
 def trajectory_to_world(
     local_xy: np.ndarray,
     odom_xy_yaw: np.ndarray,
@@ -794,6 +576,8 @@ def control_stop_reason(
     frame_timeout: float,
     odom_timeout: float,
     plan_timeout: float,
+    last_scan_time: Optional[float] = None,
+    scan_timeout: Optional[float] = None,
 ) -> Optional[str]:
     if not enable_control:
         return "control_disabled"
@@ -801,11 +585,14 @@ def control_stop_reason(
         return "arrival"
     if not trajectory_ready:
         return "trajectory_missing"
-    for name, timestamp, timeout in (
+    timestamp_checks = [
         ("frame", last_frame_time, frame_timeout),
         ("odom", last_odom_time, odom_timeout),
         ("plan", last_plan_time, plan_timeout),
-    ):
+    ]
+    if scan_timeout is not None:
+        timestamp_checks.append(("scan", last_scan_time, scan_timeout))
+    for name, timestamp, timeout in timestamp_checks:
         if timestamp is None:
             return f"{name}_missing"
         if now - timestamp > timeout:

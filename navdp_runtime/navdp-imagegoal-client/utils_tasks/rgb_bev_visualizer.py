@@ -140,6 +140,18 @@ def velocity_overlay_lines(
     return desired_line, actual_line, f"solve={solve_text} ms"
 
 
+def bev_status_line(
+    odom_status: str,
+    mpc_status: str,
+    laser_status: str,
+    laser_age_s: Optional[float],
+) -> str:
+    laser_text = laser_status
+    if laser_age_s is not None:
+        laser_text += f" age={laser_age_s:.3f} s"
+    return f"{odom_status}  {mpc_status}  {laser_text}"
+
+
 def _rasterize_points(
     image: np.ndarray,
     pixels: np.ndarray,
@@ -200,8 +212,30 @@ def render_mpc_rgb_bev(
     actual_velocity: Optional[np.ndarray] = None,
     active_traj: Optional[np.ndarray] = None,
     selected_diffusion: Optional[np.ndarray] = None,
+    laser_obstacle_xy: Optional[np.ndarray] = None,
+    laser_status: str = "LASER WAITING",
+    laser_age_s: Optional[float] = None,
 ) -> np.ndarray:
     image = np.zeros((config.size_px, config.size_px, 3), dtype=np.uint8)
+    centerline_pixels = _base_xy_to_pixels(
+        np.array(
+            [
+                [-config.rear_m, 0.0],
+                [config.forward_m, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        config,
+    )
+    cv2.line(
+        image,
+        tuple(int(value) for value in centerline_pixels[0]),
+        tuple(int(value) for value in centerline_pixels[1]),
+        (48, 48, 48),
+        1,
+        cv2.LINE_8,
+    )
+
     points, colors, ranges = backproject_rgbd_to_base(
         rgb_bgr,
         depth_m,
@@ -225,6 +259,27 @@ def render_mpc_rgb_bev(
         ranges,
         config.splat_radius_px,
     )
+
+    if (
+        laser_obstacle_xy is not None
+        and laser_status.startswith("LASER OK")
+    ):
+        laser_pixels = _base_xy_to_pixels(
+            np.asarray(laser_obstacle_xy, dtype=np.float64).reshape(-1, 2),
+            config,
+        )
+        for laser_col, laser_row in laser_pixels:
+            if (
+                0 <= laser_row < config.size_px
+                and 0 <= laser_col < config.size_px
+            ):
+                cv2.circle(
+                    image,
+                    (int(laser_col), int(laser_row)),
+                    2,
+                    (255, 0, 255),
+                    -1,
+                )
 
     if current_odom_xy_yaw is not None:
         actual_base = None
@@ -258,13 +313,14 @@ def render_mpc_rgb_bev(
                 np.asarray(active_traj)[:, :2],
                 current_odom_xy_yaw,
             )
-            for index, (guide_col, guide_row) in enumerate(
-                _base_xy_to_pixels(guide_base, config)
+            for guide_col, guide_row in _base_xy_to_pixels(
+                guide_base,
+                config,
             ):
                 cv2.circle(
                     image,
                     (int(guide_col), int(guide_row)),
-                    4 if index == 0 else 1,
+                    3,
                     (0, 255, 255),
                     -1,
                 )
@@ -288,7 +344,7 @@ def render_mpc_rgb_bev(
     )
 
     overlay_lines = velocity_overlay_lines(command, actual_velocity, solve_ms)
-    cv2.rectangle(image, (0, 0), (650, 112), (0, 0, 0), -1)
+    cv2.rectangle(image, (0, 0), (config.size_px, 140), (0, 0, 0), -1)
     for line, y in zip(overlay_lines, (24, 48, 72)):
         cv2.putText(
             image,
@@ -344,10 +400,26 @@ def render_mpc_rgb_bev(
         1,
         cv2.LINE_AA,
     )
+    cv2.line(image, (410, 96), (434, 96), (255, 0, 255), 3)
     cv2.putText(
         image,
-        f"{odom_status}  {mpc_status}",
-        (410, 102),
+        "laser",
+        (440, 102),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        bev_status_line(
+            odom_status,
+            mpc_status,
+            laser_status,
+            laser_age_s,
+        ),
+        (10, 128),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
         (255, 255, 255),
